@@ -1,54 +1,50 @@
-import React, { useState, useCallback } from 'react';
-import ReactFlow, { Background, Controls, addEdge, applyNodeChanges, applyEdgeChanges, MarkerType } from 'reactflow';
-import 'reactflow/dist/style.css'; 
-import ClassNode from './ClassNode'; // Importamos tu componente
+import { useEffect, useMemo, useRef, useState } from 'react';
+import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
+import 'reactflow/dist/style.css';
+import { FiChevronLeft, FiChevronRight, FiCopy, FiDownload, FiLogOut, FiShare2, FiUpload, FiUsers, FiX, FiZap } from 'react-icons/fi';
+import ClassNode from './ClassNode';
+import RelationEdge from './RelationEdge';
+import EditorToolbar from './EditorToolbar';
+import PropertiesPanel from './PropertiesPanel';
+import useDiagramStore from '../../stores/diagramStore';
 
-const nodeTypes = { umlClass: ClassNode };
+const nodeTypes = { umlClass: ClassNode }; const edgeTypes = { relationEdge: RelationEdge };
+const collaborators = [{ initials: 'KR', name: 'Kelly R.', role: 'Lead Architect', color: 'bg-indigo-600', status: 'Editando Usuario.java' }, { initials: 'IM', name: 'Ing. Marcos', role: 'Backend Developer', color: 'bg-emerald-600', status: 'Inspeccionando lienzo general' }, { initials: 'SM', name: 'Sofía M.', role: 'Frontend Lead', color: 'bg-amber-600', status: 'Desconectada' }];
+const cleanName = (title) => title.replace(/\.java$/, '').replace(/[^a-zA-Z0-9_]/g, '');
+const javaType = (type) => type.replace(/\s*\(.+\)/, '') === 'UUID' ? 'UUID' : type.replace(/\s*\(.+\)/, '') || 'String';
+function sourcesFor(node) { const name = cleanName(node.data.title); const variable = name.charAt(0).toLowerCase() + name.slice(1); const attrs = node.data.properties.map((a) => `  private ${javaType(a.type)} ${a.name};`).join('\n'); return [
+  { name: `entity/${name}.java`, code: `package com.diagramcraft.generated.entity;\n\nimport jakarta.persistence.*;\nimport lombok.*;\nimport java.util.UUID;\n\n@Entity\n@Getter @Setter @NoArgsConstructor\npublic class ${name} {\n${attrs}\n}` },
+  { name: `repository/${name}Repository.java`, code: `package com.diagramcraft.generated.repository;\n\nimport com.diagramcraft.generated.entity.${name};\nimport org.springframework.data.jpa.repository.JpaRepository;\nimport java.util.UUID;\n\npublic interface ${name}Repository extends JpaRepository<${name}, UUID> {\n}` },
+  { name: `service/${name}Service.java`, code: `package com.diagramcraft.generated.service;\n\nimport com.diagramcraft.generated.entity.${name};\nimport com.diagramcraft.generated.repository.${name}Repository;\nimport org.springframework.stereotype.Service;\nimport java.util.*;\n\n@Service\npublic class ${name}Service {\n  private final ${name}Repository repository;\n  public ${name}Service(${name}Repository repository) { this.repository = repository; }\n  public List<${name}> findAll() { return repository.findAll(); }\n  public ${name} save(${name} ${variable}) { return repository.save(${variable}); }\n}` },
+  { name: `controller/${name}Controller.java`, code: `package com.diagramcraft.generated.controller;\n\nimport com.diagramcraft.generated.entity.${name};\nimport com.diagramcraft.generated.service.${name}Service;\nimport org.springframework.web.bind.annotation.*;\nimport java.util.List;\n\n@RestController\n@RequestMapping("/api/${variable}s")\npublic class ${name}Controller {\n  private final ${name}Service service;\n  public ${name}Controller(${name}Service service) { this.service = service; }\n  @GetMapping public List<${name}> findAll() { return service.findAll(); }\n  @PostMapping public ${name} create(@RequestBody ${name} ${variable}) { return service.save(${variable}); }\n}` },
+]; }
+function download(name, value, type = 'text/plain;charset=utf-8') { const url = URL.createObjectURL(new Blob([value], { type })); const a = document.createElement('a'); a.href = url; a.download = name; a.click(); URL.revokeObjectURL(url); }
 
-// Tus nodos iniciales (puedes mover esto a tu diagramStore.js luego)
-const initialNodes = [
-  {
-    id: 'node-usuario',
-    type: 'umlClass',
-    position: { x: 50, y: 100 },
-    data: {
-      title: 'Usuario.java',
-      icon: 'account_box',
-      borderColor: 'border-primary-container',
-      headerBg: 'bg-primary-container',
-      headerText: 'text-on-primary',
-      methodColor: 'text-tertiary',
-      properties: [
-        { visibility: '#', name: 'id', type: 'UUID (@Id)' },
-        { visibility: '+', name: 'username', type: 'String (@Column)' },
-      ],
-      methods: ['+ getAuthorities()', '+ generateJwtToken()']
-    }
-  }
-];
-
-export default function DiagramCanvas() {
-  const [nodes, setNodes] = useState(initialNodes);
-  const [edges, setEdges] = useState([]);
-
-  const onNodesChange = useCallback((changes) => setNodes((nds) => applyNodeChanges(changes, nds)), []);
-  const onEdgesChange = useCallback((changes) => setEdges((eds) => applyEdgeChanges(changes, eds)), []);
-  const onConnect = useCallback((params) => setEdges((eds) => addEdge(params, eds)), []);
-
-  return (
-    <div className="flex-1 w-full h-full min-h-[600px] bg-surface-container-lowest rounded-lg relative shadow-2xl overflow-hidden">
-      <ReactFlow
-        nodes={nodes}
-        edges={edges}
-        onNodesChange={onNodesChange}
-        onEdgesChange={onEdgesChange}
-        onConnect={onConnect}
-        nodeTypes={nodeTypes}
-        fitView
-      >
-        <Background color="#908fa0" gap={24} size={1} />
-        <Controls className="fill-on-surface bg-surface-container-high border-none" />
-      </ReactFlow>
-    </div>
-  );
+export default function DiagramCanvas({ onLogout }) {
+  const store = useDiagramStore();
+  const { nodes, edges, selectedNodeId, onNodesChange, onEdgesChange, onConnect, selectNode, createNode, createRelation, updateNode, addAttribute, updateAttribute, removeAttribute, deleteNode } = store;
+  const [shareOpen, setShareOpen] = useState(false), [generatorOpen, setGeneratorOpen] = useState(false), [relationType, setRelationType] = useState(null), [relationTarget, setRelationTarget] = useState(''), [toast, setToast] = useState(''), [listening, setListening] = useState(false), [invite, setInvite] = useState(''), [sidebarOpen, setSidebarOpen] = useState(true);
+  const importRef = useRef(); const selectedNode = nodes.find((node) => node.id === selectedNodeId); const generated = useMemo(() => nodes.filter((n) => (n.data.kind || 'entity') === 'entity').flatMap(sourcesFor), [nodes]);
+  useEffect(() => { localStorage.setItem('diagramcraft-draft', JSON.stringify({ nodes, edges })); }, [nodes, edges]);
+  useEffect(() => { if (!toast) return undefined; const id = setTimeout(() => setToast(''), 3000); return () => clearTimeout(id); }, [toast]);
+  const notify = (text) => setToast(text);
+  const command = (raw) => { const text = raw.toLowerCase(); const match = raw.match(/(?:crea|crear|agrega|añade)\s+(?:una\s+)?(?:entidad|clase|dto)?\s*([\wÁÉÍÓÚáéíóúÑñ-]+)/i); if (match) { createNode(text.includes('dto') ? 'dto' : 'entity', match[1]); notify(`Entidad ${match[1]} creada por IA`); return; } if (text.includes('elimina') && selectedNode) { deleteNode(selectedNode.id); notify('Entidad seleccionada eliminada'); return; } if (text.includes('atributo') && selectedNode) { addAttribute(selectedNode.id); notify('Atributo agregado a la entidad seleccionada'); return; } notify('Probá: “Crea entidad Pedido”, “agrega atributo” o selecciona una clase para eliminarla.'); };
+  const listen = () => { const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition; if (!Recognition) { notify('El reconocimiento de voz no está disponible en este navegador.'); return; } const recognition = new Recognition(); recognition.lang = 'es-BO'; recognition.interimResults = false; setListening(true); recognition.onresult = (event) => command(event.results[0][0].transcript); recognition.onerror = () => notify('No se pudo reconocer el comando de voz.'); recognition.onend = () => setListening(false); recognition.start(); };
+  const exportXmi = () => { const body = nodes.map((n) => `<uml:Class xmi:id="${n.id}" name="${cleanName(n.data.title)}">${n.data.properties.map((p) => `<ownedAttribute name="${p.name}" type="${javaType(p.type)}"/>`).join('')}</uml:Class>`).join('') + edges.map((e) => `<uml:Association source="${e.source}" target="${e.target}" name="${e.data.label}"/>`).join(''); download('diagramcraft-model.xmi', `<?xml version="1.0" encoding="UTF-8"?><xmi:XMI xmlns:xmi="http://www.omg.org/XMI" xmlns:uml="http://www.omg.org/spec/UML/20161101">${body}</xmi:XMI>`, 'application/xml'); notify('Modelo XMI exportado.'); };
+  const importXmi = (event) => { const file = event.target.files?.[0]; if (!file) return; const reader = new FileReader(); reader.onload = () => { const xml = new DOMParser().parseFromString(reader.result, 'application/xml'); const classes = [...xml.getElementsByTagName('uml:Class'), ...xml.getElementsByTagName('Class')]; if (!classes.length) { notify('No se encontraron clases UML en el XMI.'); return; } classes.forEach((item, i) => createNode('entity', item.getAttribute('name') || `Clase${i + 1}`, { x: 150 + i * 40, y: 130 + i * 40 })); notify(`${classes.length} clases importadas desde XMI.`); }; reader.readAsText(file); event.target.value = ''; };
+  const copyLink = async () => { await navigator.clipboard?.writeText(`${location.origin}${location.pathname}?room=diagramcraft-live`); notify('Enlace de colaboración copiado.'); };
+  return <div className="flex h-screen min-w-[1024px] flex-col overflow-hidden bg-[#070c1a] text-slate-200">
+    <header className="flex h-16 shrink-0 items-center gap-3 overflow-hidden border-b border-[#1d2a4a] bg-[#091124] px-3"><div className="flex shrink-0 items-center gap-2 border-r border-slate-700/70 pr-4"><div className="grid h-8 w-8 place-items-center rounded-xl border border-indigo-400/40 bg-indigo-500/15 text-base text-indigo-300">◈</div><div><div className="text-sm font-bold text-white">DiagramCraft <span className="ml-1 rounded border border-indigo-400/30 bg-indigo-500/15 px-1 py-0.5 font-mono text-[9px] text-indigo-300">STUDIO</span></div><div className="text-[9px] text-emerald-400">● Sync Live · Modelo UML/JPA</div></div></div><div className="hidden shrink-0 rounded-full border border-slate-700 bg-[#0d162d] px-3 py-2 font-mono text-[10px] text-emerald-400 xl:block">Spring Boot 3.2 <span className="mx-2 text-slate-600">•</span><span className="text-sky-300">Hibernate 6 / JPA</span></div><div className="hidden min-w-0 flex-1 rounded-full border border-indigo-400/30 bg-[#0d162d] px-3 py-2 text-[10px] text-indigo-100 2xl:block"><FiZap className="mr-1 inline text-indigo-400" />Voz/IA: <i className="inline-block max-w-64 truncate align-bottom">“Crea entidad Pedido con relación 1:N a Detalle”</i><span className="ml-2 rounded bg-indigo-900/60 px-1.5 py-0.5 font-mono text-[9px] text-indigo-300">Spacebar</span></div><div className="ml-auto flex shrink-0 items-center gap-1.5"><div className="hidden -space-x-2 border-r border-slate-700 pr-3 md:flex">{collaborators.slice(0, 2).map((c) => <span key={c.name} className={`grid h-7 w-7 place-items-center rounded-full border-2 border-[#091124] ${c.color} text-[8px] font-bold`}>{c.initials}</span>)}<span className="grid h-7 w-7 place-items-center rounded-full border-2 border-[#091124] bg-sky-500 text-[8px] font-bold">TÚ</span></div><button onClick={() => setShareOpen(true)} className="flex items-center gap-1 rounded-lg bg-gradient-to-r from-indigo-600 to-violet-600 px-3 py-2.5 text-[11px] font-bold text-white hover:from-indigo-500 hover:to-violet-500"><FiShare2 /> Compartir / Invitar</button><div className="flex overflow-hidden rounded-lg border border-slate-600 bg-[#131d36]"><button onClick={() => importRef.current?.click()} title="Importar XMI" className="flex items-center gap-1 border-r border-slate-600 px-2.5 py-2.5 text-[11px] font-medium hover:bg-slate-700"><FiUpload /> Importar</button><button onClick={exportXmi} title="Exportar XMI para Enterprise Architect" className="flex items-center gap-1 px-2.5 py-2.5 text-[11px] font-medium hover:bg-slate-700"><FiDownload /> XMI (EA)</button></div><button onClick={() => setGeneratorOpen(true)} className="flex items-center gap-1 rounded-lg bg-indigo-500 px-3 py-2.5 text-[11px] font-bold text-white hover:bg-indigo-400"><FiZap className="text-yellow-200" /> Generar 4 Capas</button><button onClick={onLogout} title="Cerrar sesión" className="rounded-lg bg-rose-600 p-2.5 text-white hover:bg-rose-500"><FiLogOut /></button></div></header>
+    <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar nodes={nodes} edges={edges} onCreate={(kind) => { const n = createNode(kind); notify(`${n.data.title} añadida al lienzo.`); }} onRelation={setRelationType} onCommand={command} listening={listening} onListen={listen} onGenerate={() => setGeneratorOpen(true)} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeClick={(_, node) => selectNode(node.id)} onPaneClick={() => selectNode(null)} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow><PropertiesPanel node={selectedNode} onClose={() => selectNode(null)} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onDelete={() => deleteNode(selectedNode.id)} /><div className="absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] text-emerald-300">● Auto-guardado local activo</div></main></div>
+    {toast && <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded-lg border border-indigo-400/40 bg-[#18264a] px-4 py-3 text-sm shadow-2xl">{toast}</div>}
+    {relationType && <RelationDialog nodes={nodes} type={relationType} target={relationTarget} setTarget={setRelationTarget} onClose={() => { setRelationType(null); setRelationTarget(''); }} onCreate={(source) => { if (createRelation(relationType, source, relationTarget)) { notify('Relación JPA creada.'); setRelationType(null); setRelationTarget(''); } else notify('Elegí dos entidades diferentes.'); }} />}
+    {shareOpen && <ShareDialog invite={invite} setInvite={setInvite} onClose={() => setShareOpen(false)} onCopy={copyLink} onInvite={() => { if (invite.trim()) { notify(`Invitación enviada a ${invite}.`); setInvite(''); } }} />}
+    {generatorOpen && <GeneratorDialog generated={generated} onClose={() => setGeneratorOpen(false)} />}
+    <input ref={importRef} onChange={importXmi} type="file" accept=".xmi,.xml" className="hidden" />
+  </div>;
 }
+function RelationDialog({ nodes, type, target, setTarget, onClose, onCreate }) { const [source, setSource] = useState(nodes[0]?.id || ''); return <Modal title="Crear relación JPA" onClose={onClose}><p className="mb-4 text-sm text-slate-400">Conecta dos entidades y define la cardinalidad <b className="text-violet-300">{type}</b>.</p><div className="grid grid-cols-2 gap-3"><Select label="Origen" value={source} onChange={setSource} nodes={nodes} /><Select label="Destino" value={target} onChange={setTarget} nodes={nodes} /></div><button onClick={() => onCreate(source)} className="mt-5 w-full rounded-lg bg-indigo-600 py-2.5 font-bold hover:bg-indigo-500">Crear relación</button></Modal>; }
+function Select({ label, value, onChange, nodes }) { return <label className="text-xs text-slate-400">{label}<select value={value} onChange={(e) => onChange(e.target.value)} className="mt-1 w-full rounded border border-slate-600 bg-[#080f20] p-2 text-slate-100">{nodes.map((n) => <option key={n.id} value={n.id}>{n.data.title}</option>)}</select></label>; }
+function ShareDialog({ invite, setInvite, onClose, onCopy, onInvite }) { return <Modal title="Colaboradores del Lienzo (Tiempo Real)" onClose={onClose}><div className="mb-4 rounded-lg border border-indigo-400/30 bg-indigo-500/10 p-3"><label className="block text-xs font-bold text-indigo-200">Invitar por correo o usuario</label><div className="mt-2 flex gap-2"><input value={invite} onChange={(e) => setInvite(e.target.value)} placeholder="equipo@empresa.com" className="min-w-0 flex-1 rounded border border-slate-600 bg-[#080f20] px-3 py-2 text-sm" /><button onClick={onInvite} className="rounded bg-indigo-600 px-3 text-sm font-bold hover:bg-indigo-500">Invitar</button></div></div><div className="mb-4 rounded-lg border border-slate-700 p-3"><div className="mb-2 flex items-center gap-2 font-bold"><FiUsers className="text-indigo-300" /> Enlace de sesión en vivo</div><div className="flex gap-2"><code className="min-w-0 flex-1 truncate rounded bg-[#080f20] px-2 py-2 text-[11px] text-slate-400">{location.origin}{location.pathname}?room=diagramcraft-live</code><button onClick={onCopy} className="rounded border border-slate-600 px-3 hover:bg-slate-700"><FiCopy /></button></div></div><p className="mb-2 font-mono text-xs text-slate-400">MIEMBROS DEL PROYECTO</p>{collaborators.map((c) => <div className="mb-2 flex items-center gap-3 rounded-lg border border-slate-700 bg-[#121d39] p-2.5" key={c.name}><span className={`grid h-9 w-9 place-items-center rounded-full ${c.color} font-bold`}>{c.initials}</span><div className="flex-1"><b>{c.name}</b><span className="ml-2 text-xs text-slate-400">{c.role}</span><small className="mt-1 block text-emerald-300">● {c.status}</small></div><span className="text-xs text-slate-400">Editor</span></div>)}</Modal>; }
+function GeneratorDialog({ generated, onClose }) { const [index, setIndex] = useState(0); const item = generated[index]; return <Modal title="Generador Spring Boot · 4 capas" onClose={onClose}><p className="mb-4 text-sm text-slate-400">Entidades, repositorios, servicios y controladores listos para llevar a tu IDE.</p>{generated.length ? <><div className="mb-3 flex flex-wrap gap-2">{generated.map((g, i) => <button key={g.name} onClick={() => setIndex(i)} className={`rounded px-2 py-1 font-mono text-xs ${i === index ? 'bg-indigo-600' : 'bg-slate-700'}`}>{g.name}</button>)}</div><pre className="max-h-72 overflow-auto rounded-lg border border-slate-700 bg-[#080f20] p-3 text-xs leading-5 text-sky-200">{item.code}</pre><div className="mt-4 flex justify-end gap-2"><button onClick={() => navigator.clipboard?.writeText(item.code)} className="rounded border border-slate-600 px-3 py-2 text-sm hover:bg-slate-700"><FiCopy className="mr-1 inline" /> Copiar</button><button onClick={() => download(item.name.split('/').at(-1), item.code)} className="rounded bg-indigo-600 px-3 py-2 text-sm font-bold hover:bg-indigo-500"><FiDownload className="mr-1 inline" /> Descargar</button></div></> : <div className="rounded border border-amber-500/40 bg-amber-500/10 p-4 text-amber-200">Agrega al menos una entidad JPA para generar código.</div>}</Modal>; }
+function Modal({ title, children, onClose }) { return <div className="fixed inset-0 z-40 grid place-items-center bg-[#030715]/80 p-4 backdrop-blur-sm"><section className="max-h-[90vh] w-full max-w-2xl overflow-auto rounded-2xl border border-indigo-400/35 bg-[#101a31] p-6 shadow-2xl"><div className="mb-5 flex items-center justify-between"><h2 className="text-lg font-bold text-white">{title}</h2><button onClick={onClose} className="rounded p-1.5 text-slate-400 hover:bg-slate-700 hover:text-white"><FiX /></button></div>{children}</section></div>; }

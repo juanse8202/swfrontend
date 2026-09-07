@@ -1,4 +1,3 @@
-import React from 'react';
 import DiagramCanvas from '../components/editor/DiagramCanvas';
 import EditorToolbar from '../components/editor/EditorToolbar';
 import PropertiesPanel from '../components/editor/PropertiesPanel';

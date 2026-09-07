@@ -1,11 +1,10 @@
-import React, { useState } from 'react';
-import api from '../api/axios';
+import { useState } from 'react';
+import { iniciarOAuth, iniciarSesion } from '../api/authApi';
 
-export default function LoginPage({ onLoginSuccess }) {
-  const [username, setUsername] = useState('');
+export default function LoginPage({ onLoginSuccess, onRegister }) {
+  const [credential, setCredential] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
-  const [rememberSession, setRememberSession] = useState(true);
   const [isLoading, setIsLoading] = useState(false);
   const [btnText, setBtnText] = useState(
     'Iniciar Sesión en el Lienzo'
@@ -16,24 +15,11 @@ export default function LoginPage({ onLoginSuccess }) {
     event.preventDefault();
 
     setIsLoading(true);
-    setBtnText('Autenticando JWT...');
+    setBtnText('Autenticando sesión...');
     setBtnIcon('sync');
 
     try {
-      const response = await api.post('/login/', {
-        username,
-        password
-      });
-
-      const storage = rememberSession
-        ? localStorage
-        : sessionStorage;
-
-      storage.setItem('token', response.data.access);
-
-      if (response.data.refresh) {
-        storage.setItem('refreshToken', response.data.refresh);
-      }
+      await iniciarSesion(credential, password);
 
       setBtnText('¡Acceso concedido!');
       setBtnIcon('verified');
@@ -115,7 +101,7 @@ export default function LoginPage({ onLoginSuccess }) {
                 <span className="h-2 w-2 animate-pulse rounded-full bg-tertiary" />
 
                 <span className="font-mono text-[10px] font-semibold text-tertiary">
-                  Spring Boot REST API • Spring Security JWT • Conectado
+                  Django REST API • Sesión con cookies • Conectado
                 </span>
               </div>
 
@@ -145,10 +131,10 @@ export default function LoginPage({ onLoginSuccess }) {
                 {/* Usuario */}
                 <div>
                   <label
-                    htmlFor="username"
+                    htmlFor="credential"
                     className="mb-2 block text-xs font-semibold text-on-surface-variant"
                   >
-                    Credencial de Desarrollador
+                    Usuario o correo electrónico
                   </label>
 
                   <div className="relative flex items-center rounded-lg border border-transparent bg-surface-container transition focus-within:border-primary/50 focus-within:bg-surface-container-high">
@@ -157,16 +143,16 @@ export default function LoginPage({ onLoginSuccess }) {
                     </span>
 
                     <input
-                      id="username"
-                      name="username"
+                      id="credential"
+                      name="credential"
                       type="text"
                       autoComplete="username"
                       required
                       disabled={isLoading}
                       placeholder="Nombre de usuario o correo electrónico"
-                      value={username}
+                      value={credential}
                       onChange={(event) =>
-                        setUsername(event.target.value)
+                        setCredential(event.target.value)
                       }
                       className="w-full bg-transparent py-3.5 pl-12 pr-4 text-sm text-on-surface outline-none placeholder:text-outline disabled:cursor-not-allowed disabled:opacity-60"
                     />
@@ -234,17 +220,14 @@ export default function LoginPage({ onLoginSuccess }) {
                 <label className="flex cursor-pointer items-center gap-3 text-[11px] text-on-surface-variant">
                   <input
                     type="checkbox"
-                    checked={rememberSession}
-                    onChange={(event) =>
-                      setRememberSession(event.target.checked)
-                    }
+                    defaultChecked
                     className="h-4 w-4 cursor-pointer accent-[#8083ff]"
                   />
 
                   <span>
                     Mantener sesión activa{' '}
                     <span className="font-mono text-tertiary">
-                      (JWT Refresh Token prolongado)
+                      (cookie de sesión Django)
                     </span>
                   </span>
                 </label>
@@ -271,6 +254,8 @@ export default function LoginPage({ onLoginSuccess }) {
                 </button>
               </form>
 
+              <p className="mt-4 text-center text-xs text-on-surface-variant">¿No tienes una cuenta? <button type="button" onClick={onRegister} className="font-bold text-primary hover:text-tertiary">Regístrate</button></p>
+
               {/* Separador */}
               <div className="my-6 flex items-center gap-4">
                 <div className="h-px flex-1 bg-outline-variant/40" />
@@ -286,6 +271,7 @@ export default function LoginPage({ onLoginSuccess }) {
               <div className="grid grid-cols-3 gap-2">
                 <button
                   type="button"
+                  onClick={() => iniciarOAuth('github')}
                   className="flex items-center justify-center gap-2 rounded-lg border border-outline-variant/40 bg-surface-container px-2 py-3 text-xs text-on-surface-variant transition hover:border-primary/50 hover:bg-surface-container-high hover:text-on-surface"
                 >
                   <span className="text-base font-bold">◉</span>
@@ -294,6 +280,7 @@ export default function LoginPage({ onLoginSuccess }) {
 
                 <button
                   type="button"
+                  onClick={() => iniciarOAuth('google')}
                   className="flex items-center justify-center gap-2 rounded-lg border border-outline-variant/40 bg-surface-container px-2 py-3 text-xs text-on-surface-variant transition hover:border-primary/50 hover:bg-surface-container-high hover:text-on-surface"
                 >
                   <span className="font-bold text-[#4285F4]">G</span>
@@ -302,6 +289,7 @@ export default function LoginPage({ onLoginSuccess }) {
 
                 <button
                   type="button"
+                  onClick={() => iniciarOAuth('gitlab')}
                   className="flex items-center justify-center gap-2 rounded-lg border border-outline-variant/40 bg-surface-container px-2 py-3 text-xs text-on-surface-variant transition hover:border-primary/50 hover:bg-surface-container-high hover:text-on-surface"
                 >
                   <span className="text-orange-500">◆</span>
@@ -312,7 +300,7 @@ export default function LoginPage({ onLoginSuccess }) {
               {/* Endpoint */}
               <div className="mt-5 flex flex-wrap items-center justify-between gap-2 font-mono text-[9px]">
                 <span className="text-tertiary">
-                  POST /api/v1/auth/authenticate
+                  POST /api/login/ · Sesión Django
                 </span>
 
                 <span className="text-outline">
@@ -416,7 +404,7 @@ export default function LoginPage({ onLoginSuccess }) {
                     <p className="pl-3 text-tertiary">
                       Collection
                     </p>
-                    <p>+ generateJwtToken(): String</p>
+                    <p>+ getSessionUser(): User</p>
                   </div>
                 </article>
 
@@ -527,7 +515,7 @@ export default function LoginPage({ onLoginSuccess }) {
             <span className="material-symbols-outlined text-[13px] text-tertiary">
               lock
             </span>
-            256-Bit JWT Session • Spring Security Protected Architecture
+            Sesión segura con cookies HttpOnly • Django Security
           </span>
 
           <span className="flex items-center gap-2">
