@@ -2,3 +2,116 @@
   width: 100%;
   min-height: 100vh;
 }
+
+/* La barra de proyecto forma parte de la cabecera del editor, no ocupa una segunda fila. */
+#root > div > div:has(> header) {
+  position: relative;
+}
+
+#root > div > div:has(> header) > div:first-child {
+  position: absolute;
+  z-index: 35;
+  top: 10px;
+  left: 205px;
+  height: auto;
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+
+#root > div > div:has(> header) > div:first-child > span {
+  display: none;
+}
+
+#root > div > div:has(> header) > div:first-child > button:last-child {
+  display: none;
+}
+
+/* Presencia colaborativa junto a Compartir / Invitar. */
+#root > div > div:has(> header) > header > div:last-child > div:first-child {
+  position: relative;
+  cursor: pointer;
+  align-items: center;
+  min-height: 42px;
+  min-width: 194px;
+  border: 1px solid rgba(129, 140, 248, 0.38);
+  border-radius: 12px;
+  background: #0c152b;
+  padding: 5px 108px 5px 10px;
+  transform: translateX(-12px);
+}
+
+#root > div > div:has(> header) > header > div:last-child > div:first-child::before {
+  content: '';
+  position: absolute;
+  top: 10px;
+  right: 110px;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: #34d399;
+  box-shadow: 0 0 0 0 rgba(52, 211, 153, 0.7);
+  animation: presence-pulse 1.7s infinite;
+}
+
+#root > div > div:has(> header) > header > div:last-child > div:first-child::after {
+  content: '3 en línea\A 5 colaboradores';
+  position: absolute;
+  top: 5px;
+  right: 6px;
+  width: 96px;
+  white-space: pre-line;
+  border-left: 1px solid #334155;
+  padding-left: 7px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 9px;
+  line-height: 13px;
+  background: linear-gradient(to bottom, #34d399 0 13px, #94a3b8 13px 100%);
+  -webkit-background-clip: text;
+  background-clip: text;
+  color: transparent;
+}
+
+@keyframes presence-pulse {
+  70% { box-shadow: 0 0 0 6px rgba(52, 211, 153, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(52, 211, 153, 0); }
+}
+
+/* Los controles de React Flow no deben tapar el estado de auto-guardado. */
+.react-flow__controls {
+  transform: translateY(-54px);
+  overflow: hidden;
+  border: 1px solid #475569 !important;
+  border-radius: 9px;
+  background: #172554 !important;
+  box-shadow: 0 8px 22px rgba(2, 6, 23, 0.55);
+}
+
+.react-flow__controls-button {
+  width: 32px !important;
+  height: 32px !important;
+  border-bottom-color: #475569 !important;
+  background: #1e293b !important;
+  fill: #c7d2fe !important;
+  color: #c7d2fe !important;
+}
+
+.react-flow__controls-button:hover {
+  background: #4f46e5 !important;
+  fill: #ffffff !important;
+  color: #ffffff !important;
+}
+
+/* Reserva espacio real para proyecto + personas y evita que el comando de voz
+   quede por debajo de esos controles. */
+@media (min-width: 1280px) {
+  #root > div > div:has(> header) > header > div:nth-child(2) {
+    display: none !important;
+  }
+
+  #root > div > div:has(> header) > header > div:nth-child(3) {
+    margin-left: 500px;
+    flex: 1 1 260px;
+    max-width: 390px;
+  }
+}
