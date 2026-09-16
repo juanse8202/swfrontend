@@ -8,7 +8,7 @@ import EditorToolbar from './EditorToolbar';
 import PropertiesPanel from './PropertiesPanel';
 import ProjectsDialog from './ProjectsDialog';
 import NewProjectDialog from './NewProjectDialog';
-import useDiagramStore, { createStarterDiagram } from '../../stores/diagramStore';
+import useDiagramStore, { createStarterDiagram, setDiagramMutationListener } from '../../stores/diagramStore';
 import { contenidoDiagrama, crearDiagramaPrincipal, crearProyecto, guardarDiagrama, invitarProyecto, listarProyectos, obtenerDiagramaPrincipal } from '../../api/diagramApi';
 import { useDiagramSocket } from '../../hooks/useDiagramSocket';
 
@@ -88,6 +88,11 @@ export default function DiagramCanvas({ onLogout }) {
   const updateAttribute = (...args) => { patchAttribute(...args); scheduleCurrentSave(); };
   const removeAttribute = (...args) => { deleteAttribute(...args); scheduleCurrentSave(); };
   const deleteNode = (...args) => { removeNode(...args); scheduleCurrentSave(); };
+
+  useEffect(() => {
+    setDiagramMutationListener(scheduleCurrentSave);
+    return () => setDiagramMutationListener(null);
+  });
 
   const openProject = useCallback(async (project, closeDialog = true) => {
     try {
