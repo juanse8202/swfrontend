@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import ReactFlow, { Background, Controls, MiniMap } from 'reactflow';
 import 'reactflow/dist/style.css';
 import { FiChevronDown, FiChevronLeft, FiChevronRight, FiDownload, FiLogOut, FiPlus, FiShare2, FiUpload, FiUsers, FiX, FiZap } from 'react-icons/fi';
@@ -9,7 +9,7 @@ import PropertiesPanel from './PropertiesPanel';
 import ProjectsDialog from './ProjectsDialog';
 import NewProjectDialog from './NewProjectDialog';
 import useDiagramStore, { createStarterDiagram } from '../../stores/diagramStore';
-import { contenidoDiagrama, crearProyecto, invitarProyecto, listarProyectos, obtenerDiagramaPrincipal } from '../../api/diagramApi';
+import { contenidoDiagrama, crearDiagramaPrincipal, crearProyecto, guardarDiagrama, invitarProyecto, listarProyectos, obtenerDiagramaPrincipal } from '../../api/diagramApi';
 import { useDiagramSocket } from '../../hooks/useDiagramSocket';
 
 const nodeTypes = { umlClass: ClassNode };
@@ -17,7 +17,7 @@ const edgeTypes = { relationEdge: RelationEdge };
 
 export default function DiagramCanvas({ onLogout }) {
   const store = useDiagramStore();
-  const { nodes, edges, selectedNodeId, onNodesChange, onEdgesChange, onConnect, selectNode, createNode, createRelation, updateNode, addAttribute, updateAttribute, removeAttribute, deleteNode, restore } = store;
+  const { nodes, edges, selectedNodeId, onNodesChange: applyNodesChange, onEdgesChange: applyEdgesChange, onConnect: applyConnect, selectNode, createNode: addNode, createRelation: addRelation, updateNode: patchNode, addAttribute: appendAttribute, updateAttribute: patchAttribute, removeAttribute: deleteAttribute, deleteNode: removeNode, restore } = store;
   const [projects, setProjects] = useState([]);
   const [activeProjectId, setActiveProjectId] = useState(null);
   const [activeDiagramId, setActiveDiagramId] = useState(null);
@@ -32,13 +32,67 @@ export default function DiagramCanvas({ onLogout }) {
   const [relationTarget, setRelationTarget] = useState('');
   const [toast, setToast] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const savingRef = useRef(false);
+  const saveTimerRef = useRef(null);
+  const saveQueuedRef = useRef(false);
+  const diagramLoadedRef = useRef(false);
+  const activeProjectRef = useRef(activeProjectId);
+  const activeDiagramRef = useRef(activeDiagramId);
+  const diagramStateRef = useRef({ nodes, edges });
+
+  function scheduleSave() {
+    if (!diagramLoadedRef.current || !activeProjectRef.current) return;
+    clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(async () => {
+      if (savingRef.current) { saveQueuedRef.current = true; return; }
+      savingRef.current = true;
+      const contenido = diagramStateRef.current;
+      try {
+        if (activeDiagramRef.current) {
+          await guardarDiagrama(activeDiagramRef.current, contenido);
+        } else {
+          const diagram = await crearDiagramaPrincipal(activeProjectRef.current, contenido);
+          activeDiagramRef.current = diagram.id;
+          setActiveDiagramId(diagram.id);
+        }
+      } catch (requestError) {
+        setToast(requestError.response?.data?.detail || 'No se pudo guardar el diagrama.');
+      } finally {
+        savingRef.current = false;
+        if (saveQueuedRef.current) { saveQueuedRef.current = false; scheduleSave(); }
+      }
+    }, 700);
+  }
+
+  function scheduleCurrentSave() {
+    const current = useDiagramStore.getState();
+    diagramStateRef.current = { nodes: current.nodes, edges: current.edges };
+    scheduleSave();
+  }
+  const onNodesChange = (changes) => { applyNodesChange(changes); scheduleCurrentSave(); };
+  const onEdgesChange = (changes) => { applyEdgesChange(changes); scheduleCurrentSave(); };
+  const onConnect = (connection) => { applyConnect(connection); scheduleCurrentSave(); };
+  const createNode = (...args) => { const node = addNode(...args); scheduleCurrentSave(); return node; };
+  const createRelation = (...args) => { const created = addRelation(...args); if (created) scheduleCurrentSave(); return created; };
+  const updateNode = (...args) => { patchNode(...args); scheduleCurrentSave(); };
+  const addAttribute = (...args) => { appendAttribute(...args); scheduleCurrentSave(); };
+  const updateAttribute = (...args) => { patchAttribute(...args); scheduleCurrentSave(); };
+  const removeAttribute = (...args) => { deleteAttribute(...args); scheduleCurrentSave(); };
+  const deleteNode = (...args) => { removeNode(...args); scheduleCurrentSave(); };
 
   const openProject = useCallback(async (project, closeDialog = true) => {
     try {
+      diagramLoadedRef.current = false;
+      clearTimeout(saveTimerRef.current);
       const diagram = await obtenerDiagramaPrincipal(project);
       restore(diagram ? contenidoDiagrama(diagram) : createStarterDiagram());
+      diagramStateRef.current = useDiagramStore.getState();
+      activeProjectRef.current = project.id;
+      activeDiagramRef.current = diagram?.id || null;
+      diagramLoadedRef.current = true;
       setActiveProjectId(project.id);
       setActiveDiagramId(diagram?.id || null);
+      window.sessionStorage.setItem('diagramcraft-active-project', String(project.id));
       if (closeDialog) setProjectsOpen(false);
       if (!diagram) setToast(`El proyecto “${project.nombre || project.name}” aún no tiene un diagrama principal.`);
     } catch (requestError) {
@@ -58,7 +112,10 @@ export default function DiagramCanvas({ onLogout }) {
       if (!mounted) return;
       setProjects(items);
       setLoading(false);
-      restore(createStarterDiagram());
+      const savedProjectId = window.sessionStorage.getItem('diagramcraft-active-project');
+      const savedProject = items.find((project) => String(project.id) === savedProjectId);
+      if (savedProject) openProject(savedProject, false);
+      else restore(createStarterDiagram());
     }).catch((requestError) => {
       if (!mounted) return;
       setError(requestError.response?.data?.detail || 'No se pudieron cargar tus proyectos.');
@@ -76,7 +133,7 @@ export default function DiagramCanvas({ onLogout }) {
   const activeProject = projects.find((project) => project.id === activeProjectId);
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
   const createProject = () => { setProjectName(''); setNewProjectOpen(true); };
-  const leaveProject = () => { setActiveProjectId(null); setActiveDiagramId(null); restore(createStarterDiagram()); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
+  const leaveProject = () => { window.sessionStorage.removeItem('diagramcraft-active-project'); clearTimeout(saveTimerRef.current); diagramLoadedRef.current = false; activeProjectRef.current = null; activeDiagramRef.current = null; setActiveProjectId(null); setActiveDiagramId(null); restore(createStarterDiagram()); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
   const confirmCreateProject = async () => {
     if (!projectName.trim()) return;
     try {

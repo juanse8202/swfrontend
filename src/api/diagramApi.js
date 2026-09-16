@@ -17,6 +17,25 @@ export async function listarDiagramas(proyectoId) {
   return list(data);
 }
 
+export async function crearDiagramaPrincipal(proyectoId, contenido) {
+  const { data } = await api.post('/diagramas/diagramas/', {
+    proyecto: proyectoId,
+    nombre: 'Diagrama principal',
+    es_principal: true,
+    nodes: contenido.nodes || [],
+    edges: contenido.edges || [],
+  });
+  return data;
+}
+
+export async function guardarDiagrama(diagramaId, contenido) {
+  const { data } = await api.patch(`/diagramas/diagramas/${diagramaId}/`, {
+    nodes: contenido.nodes || [],
+    edges: contenido.edges || [],
+  });
+  return data;
+}
+
 export async function obtenerDiagramaPrincipal(proyecto) {
   const embedded = proyecto.diagrama_principal || proyecto.diagramaPrincipal;
   if (embedded) return embedded;
@@ -25,7 +44,9 @@ export async function obtenerDiagramaPrincipal(proyecto) {
 }
 
 export function contenidoDiagrama(diagrama) {
-  let content = diagrama?.contenido || diagrama?.contenido_json || diagrama?.data || diagrama?.diagrama || diagrama;
+  let content = Array.isArray(diagrama?.nodes) || Array.isArray(diagrama?.edges)
+    ? diagrama
+    : diagrama?.contenido || diagrama?.contenido_json || diagrama?.data || diagrama?.diagrama || diagrama;
   if (typeof content === 'string') {
     try { content = JSON.parse(content); } catch { return {}; }
   }
