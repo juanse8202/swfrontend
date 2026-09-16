@@ -14,6 +14,11 @@ import { useDiagramSocket } from '../../hooks/useDiagramSocket';
 
 const nodeTypes = { umlClass: ClassNode };
 const edgeTypes = { relationEdge: RelationEdge };
+const principalDraftKey = 'diagramcraft-principal-draft';
+
+function loadPrincipalDraft() {
+  try { return JSON.parse(window.sessionStorage.getItem(principalDraftKey)) || createStarterDiagram(); } catch { return createStarterDiagram(); }
+}
 
 export default function DiagramCanvas({ onLogout }) {
   const store = useDiagramStore();
@@ -67,6 +72,10 @@ export default function DiagramCanvas({ onLogout }) {
   function scheduleCurrentSave() {
     const current = useDiagramStore.getState();
     diagramStateRef.current = { nodes: current.nodes, edges: current.edges };
+    if (!activeProjectRef.current) {
+      window.sessionStorage.setItem(principalDraftKey, JSON.stringify(diagramStateRef.current));
+      return;
+    }
     scheduleSave();
   }
   const onNodesChange = (changes) => { applyNodesChange(changes); scheduleCurrentSave(); };
@@ -115,7 +124,7 @@ export default function DiagramCanvas({ onLogout }) {
       const savedProjectId = window.sessionStorage.getItem('diagramcraft-active-project');
       const savedProject = items.find((project) => String(project.id) === savedProjectId);
       if (savedProject) openProject(savedProject, false);
-      else restore(createStarterDiagram());
+      else restore(loadPrincipalDraft());
     }).catch((requestError) => {
       if (!mounted) return;
       setError(requestError.response?.data?.detail || 'No se pudieron cargar tus proyectos.');
@@ -133,7 +142,7 @@ export default function DiagramCanvas({ onLogout }) {
   const activeProject = projects.find((project) => project.id === activeProjectId);
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
   const createProject = () => { setProjectName(''); setNewProjectOpen(true); };
-  const leaveProject = () => { window.sessionStorage.removeItem('diagramcraft-active-project'); clearTimeout(saveTimerRef.current); diagramLoadedRef.current = false; activeProjectRef.current = null; activeDiagramRef.current = null; setActiveProjectId(null); setActiveDiagramId(null); restore(createStarterDiagram()); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
+  const leaveProject = () => { window.sessionStorage.removeItem('diagramcraft-active-project'); clearTimeout(saveTimerRef.current); diagramLoadedRef.current = false; activeProjectRef.current = null; activeDiagramRef.current = null; setActiveProjectId(null); setActiveDiagramId(null); restore(loadPrincipalDraft()); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
   const confirmCreateProject = async () => {
     if (!projectName.trim()) return;
     try {
