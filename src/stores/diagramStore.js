@@ -7,16 +7,20 @@ const makeNode = (kind = 'entity', title = 'NuevaEntidad', position = { x: 180, 
   const stereotypes = { entity: '@Entity', dto: 'DTO / Record', enum: 'enum', embeddable: '@Embeddable' };
   return { id: `${kind}-${crypto.randomUUID?.() || Date.now()}`, type: 'umlClass', position, data: { kind, title: title.endsWith('.java') ? title : `${title}.java`, stereotype: stereotypes[kind] || '@Entity', icon: kind === 'enum' ? 'format_list_bulleted' : kind === 'dto' ? 'description' : 'account_tree', headerBg, headerText, methodColor, properties: kind === 'entity' ? [{ visibility: '#', name: 'id', type: 'UUID (@Id)' }] : [], methods: [] } };
 };
-const initialNodes = [makeNode('entity', 'Usuario', { x: 90, y: 180 }), makeNode('entity', 'Proyecto', { x: 480, y: 210 })];
-initialNodes[0].data.properties.push({ visibility: '+', name: 'nombre', type: 'String' }, { visibility: '+', name: 'email', type: 'String' });
-initialNodes[1].data.properties.push({ visibility: '+', name: 'nombre', type: 'String' });
-const initialEdges = [{ id: 'usuario-proyecto', source: initialNodes[0].id, target: initialNodes[1].id, type: 'relationEdge', data: { label: '@OneToMany', cardinality: '1 : N' } }];
+export const createStarterDiagram = () => {
+  const usuario = makeNode('entity', 'Usuario', { x: 90, y: 300 });
+  usuario.data.properties.push({ visibility: '+', name: 'nombre', type: 'String' }, { visibility: '+', name: 'email', type: 'String' });
+  const proyecto = makeNode('entity', 'Proyecto', { x: 480, y: 120 });
+  proyecto.data.properties.push({ visibility: '+', name: 'nombre', type: 'String' }, { visibility: '+', name: 'direccion', type: 'String' });
+  return {
+    nodes: [usuario, proyecto],
+    edges: [{ id: 'usuario-proyecto', source: usuario.id, target: proyecto.id, type: 'relationEdge', data: { label: '@OneToMany', cardinality: '1 : N' } }],
+  };
+};
 const relationMeta = { oneToMany: ['@OneToMany', '1 : N'], manyToOne: ['@ManyToOne', 'N : 1'], manyToMany: ['@ManyToMany', 'N : M'], oneToOne: ['@OneToOne', '1 : 1'] };
-let savedDiagram;
-try { savedDiagram = JSON.parse(localStorage.getItem('diagramcraft-draft')); } catch { savedDiagram = null; }
 
 const useDiagramStore = create((set, get) => ({
-  nodes: savedDiagram?.nodes?.length ? savedDiagram.nodes : initialNodes, edges: savedDiagram?.edges || initialEdges, selectedNodeId: null,
+  nodes: [], edges: [], selectedNodeId: null,
   onNodesChange: (changes) => set({ nodes: applyNodeChanges(changes, get().nodes) }),
   onEdgesChange: (changes) => set({ edges: applyEdgeChanges(changes, get().edges) }),
   onConnect: (connection) => set({ edges: addEdge({ ...connection, id: `rel-${Date.now()}`, type: 'relationEdge', data: { label: '@OneToMany', cardinality: '1 : N' } }, get().edges) }),
@@ -28,6 +32,6 @@ const useDiagramStore = create((set, get) => ({
   removeAttribute: (id, index) => set({ nodes: get().nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, properties: node.data.properties.filter((_, i) => i !== index) } } : node) }),
   deleteNode: (id) => set({ nodes: get().nodes.filter((node) => node.id !== id), edges: get().edges.filter((edge) => edge.source !== id && edge.target !== id), selectedNodeId: null }),
   createRelation: (type, source, target) => { if (!source || !target || source === target) return false; const [label, cardinality] = relationMeta[type] || relationMeta.oneToMany; set({ edges: [...get().edges, { id: `rel-${Date.now()}`, source, target, type: 'relationEdge', data: { label, cardinality } }] }); return true; },
-  restore: (diagram) => set({ nodes: diagram.nodes || initialNodes, edges: diagram.edges || initialEdges }),
+  restore: (diagram = {}) => set({ nodes: diagram.nodes || [], edges: diagram.edges || [], selectedNodeId: null }),
 }));
 export default useDiagramStore;

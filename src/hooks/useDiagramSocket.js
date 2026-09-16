@@ -7,8 +7,9 @@ export function useDiagramSocket(diagramId, onMessage) {
   const [status, setStatus] = useState('offline');
 
   useEffect(() => {
-    const base = import.meta.env.VITE_WS_URL;
-    if (!base) return undefined;
+    if (!diagramId) return undefined;
+    const apiUrl = import.meta.env.VITE_API_URL || window.location.origin;
+    const base = import.meta.env.VITE_WS_URL || apiUrl.replace(/^http/, 'ws').replace(/\/api\/?$/, '/ws');
     const socket = new WebSocket(`${base.replace(/\/$/, '')}/diagrams/${diagramId}/`);
     socketRef.current = socket;
     socket.onopen = () => setStatus('connected');
