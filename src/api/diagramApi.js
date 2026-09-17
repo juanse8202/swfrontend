@@ -1,6 +1,13 @@
 import api from './axios';
 
 const list = (payload) => (Array.isArray(payload) ? payload : payload?.results || []);
+const projectIdOf = (project) => (typeof project === 'object' ? project?.id : project);
+const belongsToProject = (diagram, proyectoId) => {
+  // El endpoint ya filtra por proyecto. La comprobación adicional solo se
+  // aplica cuando el serializer expone `proyecto`.
+  if (diagram?.proyecto === undefined || diagram.proyecto === null) return true;
+  return String(projectIdOf(diagram.proyecto)) === String(proyectoId);
+};
 
 export async function listarProyectos() {
   const { data } = await api.get('/proyectos/proyectos/');
@@ -13,8 +20,10 @@ export async function crearProyecto(nombre) {
 }
 
 export async function listarDiagramas(proyectoId) {
+  // Con api.baseURL = <host>/api, esto genera GET
+  // <host>/api/diagramas/diagramas/?proyecto=<id>.
   const { data } = await api.get('/diagramas/diagramas/', { params: { proyecto: proyectoId } });
-  return list(data);
+  return list(data).filter((diagram) => belongsToProject(diagram, proyectoId));
 }
 
 export async function crearDiagramaPrincipal(proyectoId, contenido) {
@@ -38,8 +47,10 @@ export async function guardarDiagrama(diagramaId, contenido) {
 
 export async function obtenerDiagramaPrincipal(proyecto) {
   const embedded = proyecto.diagrama_principal || proyecto.diagramaPrincipal;
-  if (embedded) return embedded;
+  if (embedded && belongsToProject(embedded, proyecto.id)) return embedded;
   const diagrams = await listarDiagramas(proyecto.id);
+  // La API ya respondió filtrada por proyecto; algunos serializers no envían
+  // la bandera de principal cuando solo hay un diagrama.
   return diagrams.find((diagram) => diagram.es_principal || diagram.principal || diagram.is_main) || diagrams[0] || null;
 }
 

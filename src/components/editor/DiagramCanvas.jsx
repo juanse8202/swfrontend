@@ -37,6 +37,7 @@ export default function DiagramCanvas({ onLogout }) {
   const [relationTarget, setRelationTarget] = useState('');
   const [toast, setToast] = useState('');
   const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [saveStatus, setSaveStatus] = useState('local');
   const savingRef = useRef(false);
   const saveTimerRef = useRef(null);
   const saveQueuedRef = useRef(false);
@@ -44,37 +45,81 @@ export default function DiagramCanvas({ onLogout }) {
   const activeProjectRef = useRef(activeProjectId);
   const activeDiagramRef = useRef(activeDiagramId);
   const diagramStateRef = useRef({ nodes, edges });
+  const hasPendingChangesRef = useRef(false);
+  const socketSyncTimerRef = useRef(null);
+
+  const onSocketMessage = useCallback((event) => {
+    if (event?.type === 'diagram.error') {
+      setToast(`Error de sincronización: ${event.detail || 'el servidor rechazó el cambio.'}`);
+      return;
+    }
+    if (event?.type !== 'diagram.update' || String(event.diagram_id) !== String(activeDiagramRef.current)) return;
+    if (Array.isArray(event.nodes) && Array.isArray(event.edges)) {
+      // restore escribe directamente nodes/edges en el store, equivalente a
+      // setNodes(event.nodes) y setEdges(event.edges) de React Flow.
+      restore({ nodes: event.nodes, edges: event.edges }, { preserveSelection: true });
+      diagramStateRef.current = { nodes: event.nodes, edges: event.edges };
+      hasPendingChangesRef.current = false;
+      setSaveStatus('saved');
+    }
+  }, [restore]);
+  const { status: socketStatus, send: sendSocketEvent } = useDiagramSocket(activeDiagramId, onSocketMessage);
+
+  async function persistPendingChanges() {
+    if (!diagramLoadedRef.current || !activeProjectRef.current || !hasPendingChangesRef.current) return;
+    if (savingRef.current) { saveQueuedRef.current = true; return; }
+    savingRef.current = true;
+    setSaveStatus('saving');
+    const contenido = diagramStateRef.current;
+    try {
+      if (activeDiagramRef.current) {
+        await guardarDiagrama(activeDiagramRef.current, contenido);
+      } else {
+        const diagram = await crearDiagramaPrincipal(activeProjectRef.current, contenido);
+        activeDiagramRef.current = diagram.id;
+        setActiveDiagramId(diagram.id);
+      }
+      hasPendingChangesRef.current = false;
+      setSaveStatus('saved');
+    } catch (requestError) {
+      setSaveStatus('error');
+      setToast(requestError.response?.data?.detail || 'No se pudo guardar el diagrama.');
+    } finally {
+      savingRef.current = false;
+      if (saveQueuedRef.current) {
+        saveQueuedRef.current = false;
+        setSaveStatus('pending');
+        saveTimerRef.current = setTimeout(() => { persistPendingChanges(); }, 700);
+      }
+    }
+  }
 
   function scheduleSave() {
     if (!diagramLoadedRef.current || !activeProjectRef.current) return;
     clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(async () => {
-      if (savingRef.current) { saveQueuedRef.current = true; return; }
-      savingRef.current = true;
-      const contenido = diagramStateRef.current;
-      try {
-        if (activeDiagramRef.current) {
-          await guardarDiagrama(activeDiagramRef.current, contenido);
-        } else {
-          const diagram = await crearDiagramaPrincipal(activeProjectRef.current, contenido);
-          activeDiagramRef.current = diagram.id;
-          setActiveDiagramId(diagram.id);
-        }
-      } catch (requestError) {
-        setToast(requestError.response?.data?.detail || 'No se pudo guardar el diagrama.');
-      } finally {
-        savingRef.current = false;
-        if (saveQueuedRef.current) { saveQueuedRef.current = false; scheduleSave(); }
-      }
-    }, 700);
+    setSaveStatus('pending');
+    saveTimerRef.current = setTimeout(() => { persistPendingChanges(); }, 700);
   }
 
   function scheduleCurrentSave() {
     const current = useDiagramStore.getState();
     diagramStateRef.current = { nodes: current.nodes, edges: current.edges };
+    hasPendingChangesRef.current = true;
     if (!activeProjectRef.current) {
       window.sessionStorage.setItem(principalDraftKey, JSON.stringify(diagramStateRef.current));
+      setSaveStatus('local');
       return;
+    }
+    if (activeDiagramRef.current) {
+      clearTimeout(socketSyncTimerRef.current);
+      socketSyncTimerRef.current = setTimeout(() => {
+        sendSocketEvent({
+          type: 'diagram.update',
+          diagram_id: activeDiagramRef.current,
+          nodes: diagramStateRef.current.nodes,
+          edges: diagramStateRef.current.edges,
+        });
+      }, 80);
     }
     scheduleSave();
   }
@@ -91,34 +136,41 @@ export default function DiagramCanvas({ onLogout }) {
 
   useEffect(() => {
     setDiagramMutationListener(scheduleCurrentSave);
-    return () => setDiagramMutationListener(null);
   });
 
-  const openProject = useCallback(async (project, closeDialog = true) => {
+  // Este cleanup debe ejecutarse únicamente al desmontar el editor. Si se
+  // ejecuta tras cada render, cancela el envío WebSocket programado al arrastrar.
+  useEffect(() => {
+    return () => {
+      clearTimeout(socketSyncTimerRef.current);
+      setDiagramMutationListener(null);
+    };
+  }, []);
+
+  const openProject = useCallback(async (project, closeDialog = true, forceEmpty = false) => {
     try {
-      diagramLoadedRef.current = false;
       clearTimeout(saveTimerRef.current);
-      const diagram = await obtenerDiagramaPrincipal(project);
-      restore(diagram ? contenidoDiagrama(diagram) : createStarterDiagram());
+      await persistPendingChanges();
+      diagramLoadedRef.current = false;
+      const diagram = forceEmpty ? null : await obtenerDiagramaPrincipal(project);
+      restore(diagram ? contenidoDiagrama(diagram) : { nodes: [], edges: [] });
       diagramStateRef.current = useDiagramStore.getState();
+      hasPendingChangesRef.current = false;
       activeProjectRef.current = project.id;
       activeDiagramRef.current = diagram?.id || null;
       diagramLoadedRef.current = true;
       setActiveProjectId(project.id);
       setActiveDiagramId(diagram?.id || null);
+      setSaveStatus(diagram ? 'saved' : 'empty');
       window.sessionStorage.setItem('diagramcraft-active-project', String(project.id));
       if (closeDialog) setProjectsOpen(false);
       if (!diagram) setToast(`El proyecto “${project.nombre || project.name}” aún no tiene un diagrama principal.`);
     } catch (requestError) {
       setToast(requestError.response?.data?.detail || 'No se pudo cargar el diagrama principal.');
     }
+  // persistPendingChanges solo opera sobre refs; restore es la única dependencia reactiva.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [restore]);
-
-  const onSocketMessage = useCallback((event) => {
-    const diagram = contenidoDiagrama(event);
-    if (diagram.nodes || diagram.edges) restore(diagram);
-  }, [restore]);
-  const { status: socketStatus } = useDiagramSocket(activeDiagramId, onSocketMessage);
 
   useEffect(() => {
     let mounted = true;
@@ -147,14 +199,14 @@ export default function DiagramCanvas({ onLogout }) {
   const activeProject = projects.find((project) => project.id === activeProjectId);
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
   const createProject = () => { setProjectName(''); setNewProjectOpen(true); };
-  const leaveProject = () => { window.sessionStorage.removeItem('diagramcraft-active-project'); clearTimeout(saveTimerRef.current); diagramLoadedRef.current = false; activeProjectRef.current = null; activeDiagramRef.current = null; setActiveProjectId(null); setActiveDiagramId(null); restore(loadPrincipalDraft()); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
+  const leaveProject = async () => { clearTimeout(saveTimerRef.current); await persistPendingChanges(); window.sessionStorage.removeItem('diagramcraft-active-project'); diagramLoadedRef.current = false; activeProjectRef.current = null; activeDiagramRef.current = null; hasPendingChangesRef.current = false; setActiveProjectId(null); setActiveDiagramId(null); setSaveStatus('local'); restore(loadPrincipalDraft()); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
   const confirmCreateProject = async () => {
     if (!projectName.trim()) return;
     try {
       const project = await crearProyecto(projectName.trim());
       setProjects((current) => [project, ...current]);
       setNewProjectOpen(false);
-      await openProject(project);
+      await openProject(project, true, true);
       setToast(`Proyecto “${project.nombre || project.name}” creado.`);
     } catch (requestError) {
       setToast(requestError.response?.data?.detail || 'No se pudo crear el proyecto.');
@@ -174,6 +226,14 @@ export default function DiagramCanvas({ onLogout }) {
   if (loading) return <State message="Cargando proyectos…" />;
   if (error) return <State message={error} error />;
   const displayedProject = activeProject || { name: 'Sin proyecto' };
+  const syncIndicator = {
+    local: { label: 'Borrador local', color: 'text-slate-300' },
+    empty: { label: 'Diagrama aún no guardado', color: 'text-slate-300' },
+    pending: { label: 'Cambios pendientes', color: 'text-amber-300' },
+    saving: { label: 'Guardando diagrama…', color: 'text-amber-300' },
+    saved: { label: socketStatus === 'connected' ? 'Guardado · Sync Live' : 'Guardado · Sin conexión en vivo', color: socketStatus === 'connected' ? 'text-emerald-300' : 'text-slate-300' },
+    error: { label: 'Error al guardar', color: 'text-rose-300' },
+  }[saveStatus];
 
   return <div className="flex h-screen min-w-[1024px] flex-col overflow-hidden bg-[#070c1a] text-slate-200">
     <header className="flex h-[70px] shrink-0 items-center gap-2 overflow-hidden border-b border-[#1d2a4a] bg-[#091124] px-3">
@@ -184,7 +244,7 @@ export default function DiagramCanvas({ onLogout }) {
       <button className="hidden shrink-0 items-center gap-2 rounded-lg border border-slate-600 bg-[#131d36] px-3 py-2 text-xs font-bold hover:bg-slate-700 lg:flex"><span className="flex -space-x-1"><i className="grid h-6 w-6 place-items-center rounded-full border-2 border-[#091124] bg-indigo-600 text-[8px] not-italic">KR</i><i className="grid h-6 w-6 place-items-center rounded-full border-2 border-[#091124] bg-emerald-600 text-[8px] not-italic">IM</i><i className="grid h-6 w-6 place-items-center rounded-full border-2 border-[#091124] bg-sky-500 text-[8px] not-italic">TÚ</i></span><span className="text-[9px] text-emerald-300">3<br /><span className="text-slate-400">en línea</span></span></button>
       <div className="ml-1 flex shrink-0 gap-1"><button onClick={() => setShareOpen(true)} className="flex items-center gap-1 rounded-lg bg-gradient-to-r from-indigo-600 to-violet-600 px-3 py-2.5 text-[11px] font-bold text-white hover:from-indigo-500 hover:to-violet-500"><FiShare2 /> Compartir / Invitar</button><button onClick={() => setToast('Importación XMI disponible al conectar la persistencia del diagrama.')} className="flex items-center gap-1 rounded-lg border border-slate-600 bg-[#131d36] px-2.5 py-2.5 text-[11px] font-medium hover:bg-slate-700"><FiUpload /> Importar</button><button onClick={() => setToast('Exportación XMI disponible al conectar la persistencia del diagrama.')} className="flex items-center gap-1 rounded-lg border border-slate-600 bg-[#131d36] px-2.5 py-2.5 text-[11px] font-medium hover:bg-slate-700"><FiDownload /> XMI (EA)</button><button onClick={() => setToast('Generador de 4 capas listo para los nodos del diagrama.')} className="flex items-center gap-1 rounded-lg bg-indigo-500 px-3 py-2.5 text-[11px] font-bold text-white hover:bg-indigo-400"><FiZap className="text-yellow-200" /> Generar 4 Capas</button><button onClick={onLogout} title="Cerrar sesión" className="rounded-lg bg-rose-600 p-2.5 text-white hover:bg-rose-500"><FiLogOut /></button></div>
     </header>
-    <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar nodes={nodes} edges={edges} onCreate={(kind) => createNode(kind)} onRelation={setRelationType} onCommand={() => {}} onListen={() => {}} onGenerate={() => {}} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeClick={(_, node) => selectNode(node.id)} onPaneClick={() => selectNode(null)} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow><PropertiesPanel node={selectedNode} onClose={() => selectNode(null)} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onDelete={() => deleteNode(selectedNode.id)} /><div className="absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] text-emerald-300">● Diagrama sincronizado</div></main></div>
+    <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar nodes={nodes} edges={edges} onCreate={(kind) => createNode(kind)} onRelation={setRelationType} onCommand={() => {}} onListen={() => {}} onGenerate={() => {}} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow nodes={nodes} edges={edges} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange} onConnect={onConnect} onNodeClick={(_, node) => selectNode(node.id)} onPaneClick={() => selectNode(null)} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow><PropertiesPanel node={selectedNode} onClose={() => selectNode(null)} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onDelete={() => deleteNode(selectedNode.id)} /><div className={`absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] ${syncIndicator.color}`}>● {syncIndicator.label}</div></main></div>
     {toast && <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded bg-[#18264a] px-4 py-3">{toast}</div>}
     {projectsOpen && <ProjectsDialog projects={projects} activeId={activeProjectId} onClose={() => setProjectsOpen(false)} onNew={createProject} onOpen={openProject} onDuplicate={() => setToast('La duplicación se administra en el backend.')} onLeaveProject={leaveProject} />}
     {newProjectOpen && <NewProjectDialog name={projectName} setName={setProjectName} onClose={() => setNewProjectOpen(false)} onCreate={confirmCreateProject} />}

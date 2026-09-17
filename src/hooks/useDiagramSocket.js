@@ -10,12 +10,18 @@ export function useDiagramSocket(diagramId, onMessage) {
     if (!diagramId) return undefined;
     const apiUrl = import.meta.env.VITE_API_URL || window.location.origin;
     const base = import.meta.env.VITE_WS_URL || apiUrl.replace(/^http/, 'ws').replace(/\/api\/?$/, '/ws');
-    const socket = new WebSocket(`${base.replace(/\/$/, '')}/diagrams/${diagramId}/`);
+    const socket = new WebSocket(`${base.replace(/\/$/, '')}/diagramas/${diagramId}/`);
     socketRef.current = socket;
     socket.onopen = () => setStatus('connected');
     socket.onclose = () => setStatus('offline');
     socket.onerror = () => setStatus('offline');
-    socket.onmessage = (event) => onMessage?.(JSON.parse(event.data));
+    socket.onmessage = (event) => {
+      try {
+        onMessage?.(JSON.parse(event.data));
+      } catch {
+        setStatus('offline');
+      }
+    };
     return () => socket.close();
   }, [diagramId, onMessage]);
 

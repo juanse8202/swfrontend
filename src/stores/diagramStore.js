@@ -39,6 +39,12 @@ const useDiagramStore = create((set, get) => ({
     diagramMutationListener?.();
   },
   createRelation: (type, source, target) => { if (!source || !target || source === target) return false; const [label, cardinality] = relationMeta[type] || relationMeta.oneToMany; const [multiplicidadOrigen, multiplicidadDestino] = cardinality.split(':').map((value) => value.trim()); set({ edges: [...get().edges, { id: `rel-${Date.now()}`, source, target, type: 'relationEdge', data: { label, cardinality, multiplicidadOrigen, multiplicidadDestino } }] }); return true; },
-  restore: (diagram = {}) => set({ nodes: diagram.nodes || [], edges: diagram.edges || [], selectedNodeId: null }),
+  restore: (diagram = {}, { preserveSelection = false } = {}) => set((current) => {
+    const nodes = diagram.nodes || [];
+    const selectedNodeId = preserveSelection && nodes.some((node) => node.id === current.selectedNodeId)
+      ? current.selectedNodeId
+      : null;
+    return { nodes, edges: diagram.edges || [], selectedNodeId };
+  }),
 }));
 export default useDiagramStore;
