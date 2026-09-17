@@ -27,6 +27,11 @@ function App() {
     } catch (error) {
       console.warn('No se pudo cerrar la sesi\u00f3n en el servidor.', error);
     } finally {
+      // El proyecto activo es una preferencia de la sesi\u00f3n actual. Al salir,
+      // no debe restaurarse al iniciar sesi\u00f3n de nuevo (ni para otro usuario
+      // que use el mismo navegador).
+      window.sessionStorage.removeItem('diagramcraft-active-project');
+      sessionRequest = null;
       setIsAuthenticated(false);
     }
   };
