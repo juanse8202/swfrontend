@@ -65,7 +65,16 @@ export function contenidoDiagrama(diagrama) {
   return { ...content, nodes: content.nodes || content.nodos || [], edges: content.edges || content.aristas || [] };
 }
 
-export async function invitarProyecto(proyectoId, email) {
-  const { data } = await api.post(`/proyectos/proyectos/${proyectoId}/invitar/`, { email });
+export async function invitarProyecto(proyectoId, email, rol) {
+  const { data } = await api.post(`/proyectos/proyectos/${proyectoId}/invitar/`, { email, rol });
   return data;
+}
+
+export async function actualizarRolMiembro(proyectoId, usuarioId, rol) {
+  const { data } = await api.patch(`/proyectos/proyectos/${proyectoId}/miembros/${usuarioId}/`, { rol });
+  return data;
+}
+
+export async function eliminarColaborador(proyectoId, usuarioId) {
+  await api.delete(`/proyectos/proyectos/${proyectoId}/colaboradores/${usuarioId}/`);
 }

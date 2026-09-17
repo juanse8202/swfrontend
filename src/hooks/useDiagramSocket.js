@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 
 // Adaptador opcional para el WebSocket del backend. El editor funciona también
 // sin conexión y conserva el borrador local hasta que el servidor esté disponible.
@@ -25,8 +25,8 @@ export function useDiagramSocket(diagramId, onMessage) {
     return () => socket.close();
   }, [diagramId, onMessage]);
 
-  const send = (event) => {
+  const send = useCallback((event) => {
     if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify(event));
-  };
+  }, []);
   return { status, send };
 }
