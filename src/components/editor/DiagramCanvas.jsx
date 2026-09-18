@@ -34,6 +34,7 @@ export default function DiagramCanvas({ onLogout }) {
   const [projectsOpen, setProjectsOpen] = useState(false);
   const [newProjectOpen, setNewProjectOpen] = useState(false);
   const [projectName, setProjectName] = useState('');
+  const [projectNameError, setProjectNameError] = useState('');
   const [shareOpen, setShareOpen] = useState(false);
   const [peopleOpen, setPeopleOpen] = useState(false);
   const [invite, setInvite] = useState('');
@@ -224,18 +225,26 @@ export default function DiagramCanvas({ onLogout }) {
   const canUseRelations = !activeProject || isOwner || ['propietario', 'arquitecto'].includes(currentRole);
   useEffect(() => { canEditRef.current = canEdit; }, [canEdit]);
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
-  const createProject = () => { setProjectName(''); setNewProjectOpen(true); };
+  const createProject = () => { setProjectName(''); setProjectNameError(''); setNewProjectOpen(true); };
   const leaveProject = async () => { clearTimeout(saveTimerRef.current); await persistPendingChanges(); window.sessionStorage.removeItem('diagramcraft-active-project'); diagramLoadedRef.current = false; activeProjectRef.current = null; activeDiagramRef.current = null; hasPendingChangesRef.current = false; setActiveProjectId(null); setActiveDiagramId(null); setSaveStatus('local'); restore(loadPrincipalDraft()); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
   const confirmCreateProject = async () => {
-    if (!projectName.trim()) return;
+    const normalizedName = projectName.trim();
+    if (!normalizedName) return;
+    if (projects.some((project) => (project.nombre || project.name || '').trim().toLocaleLowerCase() === normalizedName.toLocaleLowerCase())) {
+      setProjectNameError('Ya tienes un proyecto activo con este nombre.');
+      return;
+    }
     try {
-      const project = await crearProyecto(projectName.trim());
+      const project = await crearProyecto(normalizedName);
       setProjects((current) => [project, ...current]);
       setNewProjectOpen(false);
       await openProject(project, true, true);
       setToast(`Proyecto “${project.nombre || project.name}” creado.`);
     } catch (requestError) {
-      setToast(requestError.response?.data?.detail || 'No se pudo crear el proyecto.');
+      const nombreError = requestError.response?.data?.errors?.nombre;
+      const message = Array.isArray(nombreError) ? nombreError.join(' ') : nombreError;
+      if (message) setProjectNameError(message);
+      else setToast(requestError.response?.data?.detail || 'No se pudo crear el proyecto.');
     }
   };
   const sendInvite = async (rol) => {
@@ -289,8 +298,8 @@ export default function DiagramCanvas({ onLogout }) {
     </header>
     <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar readOnly={isReadOnly} canUseRelations={canUseRelations} onlineMembers={onlineMembers} nodes={nodes} edges={edges} onCreate={(kind) => canEdit && createNode(kind)} onRelation={(type) => canUseRelations && setRelationType(type)} onCommand={() => {}} onListen={() => {}} onGenerate={() => {}} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow nodes={nodes} edges={edges} nodesDraggable={canEdit} nodesConnectable={canUseRelations} elementsSelectable={canEdit} onNodesChange={canEdit ? onNodesChange : undefined} onEdgesChange={canEdit ? onEdgesChange : undefined} onConnect={canUseRelations ? onConnect : undefined} onNodeClick={(_, node) => selectNode(node.id)} onPaneClick={() => selectNode(null)} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow>{canEdit && <PropertiesPanel node={selectedNode} onClose={() => selectNode(null)} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onDelete={() => deleteNode(selectedNode.id)} />}<div className={`absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] ${syncIndicator.color}`}>● {isReadOnly ? 'Modo solo lectura' : syncIndicator.label}</div></main></div>
     {toast && <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded bg-[#18264a] px-4 py-3">{toast}</div>}
-    {projectsOpen && <ProjectsDialog projects={projects} activeId={activeProjectId} currentUserId={currentUser?.id} onClose={() => setProjectsOpen(false)} onNew={createProject} onOpen={openProject} onDuplicate={() => setToast('La duplicación se administra en el backend.')} onLeaveProject={leaveProject} />}
-    {newProjectOpen && <NewProjectDialog name={projectName} setName={setProjectName} onClose={() => setNewProjectOpen(false)} onCreate={confirmCreateProject} />}
+    {projectsOpen && <ProjectsDialog projects={projects} activeId={activeProjectId} onClose={() => setProjectsOpen(false)} onNew={createProject} onOpen={openProject} onLeaveProject={leaveProject} onRefresh={() => listarProyectos().then(setProjects)} />}
+    {newProjectOpen && <NewProjectDialog name={projectName} setName={(name) => { setProjectName(name); setProjectNameError(''); }} error={projectNameError} onClose={() => setNewProjectOpen(false)} onCreate={confirmCreateProject} />}
     {shareOpen && <CollaboratorsDialog project={activeProject} email={invite} setEmail={setInvite} onClose={() => setShareOpen(false)} onInvite={sendInvite} onChangeRole={changeMemberRole} onRemove={removeMember} currentUserId={currentUser?.id} canInvite={isOwner} canManage={isOwner} />}
     {peopleOpen && <PeopleDialog members={onlineMembers} project={activeProject} onClose={() => setPeopleOpen(false)} />}
     {relationType && <RelationDialog nodes={nodes} type={relationType} target={relationTarget} setTarget={setRelationTarget} onClose={() => { setRelationType(null); setRelationTarget(''); }} onCreate={(source) => { if (createRelation(relationType, source, relationTarget)) { setRelationType(null); setRelationTarget(''); } }} />}

@@ -24,15 +24,14 @@ function App() {
   const handleLogout = async () => {
     try {
       await cerrarSesion();
-    } catch (error) {
-      console.warn('No se pudo cerrar la sesi\u00f3n en el servidor.', error);
-    } finally {
-      // El proyecto activo es una preferencia de la sesi\u00f3n actual. Al salir,
-      // no debe restaurarse al iniciar sesi\u00f3n de nuevo (ni para otro usuario
-      // que use el mismo navegador).
+      // Sólo se elimina el estado local cuando el backend confirma (204) que
+      // la cookie de sesión fue invalidada.
       window.sessionStorage.removeItem('diagramcraft-active-project');
+      window.sessionStorage.removeItem('diagramcraft-principal-draft');
       sessionRequest = null;
       setIsAuthenticated(false);
+    } catch (error) {
+      console.warn('No se pudo cerrar la sesi\u00f3n en el servidor.', error);
     }
   };
 

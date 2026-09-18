@@ -9,8 +9,11 @@ const belongsToProject = (diagram, proyectoId) => {
   return String(projectIdOf(diagram.proyecto)) === String(proyectoId);
 };
 
-export async function listarProyectos() {
-  const { data } = await api.get('/proyectos/proyectos/');
+export async function listarProyectos({ filtro, archivados } = {}) {
+  const params = {};
+  if (filtro && filtro !== 'all') params.filtro = filtro;
+  if (archivados) params.archivados = 'true';
+  const { data } = await api.get('/proyectos/proyectos/', { params });
   return list(data).map((project) => ({ ...project, name: project.nombre || project.name }));
 }
 
@@ -68,6 +71,39 @@ export function contenidoDiagrama(diagrama) {
 export async function invitarProyecto(proyectoId, email, rol) {
   const { data } = await api.post(`/proyectos/proyectos/${proyectoId}/invitar/`, { email, rol });
   return data;
+}
+
+export async function listarInvitacionesPendientes() {
+  const { data } = await api.get('/proyectos/invitaciones/pendientes/');
+  return list(data);
+}
+
+export async function aceptarInvitacion(invitacionId) {
+  const { data } = await api.post(`/proyectos/invitaciones/${invitacionId}/aceptar/`);
+  return data;
+}
+
+export async function rechazarInvitacion(invitacionId) {
+  await api.post(`/proyectos/invitaciones/${invitacionId}/rechazar/`);
+}
+
+export async function duplicarProyecto(proyectoId) {
+  const { data } = await api.post(`/proyectos/proyectos/${proyectoId}/duplicar/`);
+  return { ...data, name: data.nombre || data.name };
+}
+
+export async function archivarProyecto(proyectoId) {
+  const { data } = await api.post(`/proyectos/proyectos/${proyectoId}/archivar/`);
+  return data;
+}
+
+export async function restaurarProyecto(proyectoId) {
+  const { data } = await api.post(`/proyectos/proyectos/${proyectoId}/restaurar/`);
+  return data;
+}
+
+export async function eliminarProyecto(proyectoId) {
+  await api.delete(`/proyectos/proyectos/${proyectoId}/`);
 }
 
 export async function actualizarRolMiembro(proyectoId, usuarioId, rol) {

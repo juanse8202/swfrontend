@@ -26,7 +26,11 @@ export function registrar(email, password) { return request('/api/registro/', { 
 
 export async function cerrarSesion() {
   const csrfToken = await getCsrfToken();
-  await fetch(`${API_URL}/api/logout/`, { method: 'POST', credentials: 'include', headers: { 'X-CSRFToken': csrfToken } });
+  const response = await fetch(`${API_URL}/api/logout/`, { method: 'POST', credentials: 'include', headers: { 'X-CSRFToken': csrfToken } });
+  if (response.status !== 204) {
+    const data = await response.json().catch(() => ({}));
+    throw new Error(data.detail || 'El servidor no confirmó el cierre de sesión.');
+  }
 }
 
 export function iniciarOAuth(provider) { window.location.href = `${API_URL}/accounts/${provider}/login/`; }
