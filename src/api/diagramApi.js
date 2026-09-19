@@ -87,6 +87,15 @@ export async function rechazarInvitacion(invitacionId) {
   await api.post(`/proyectos/invitaciones/${invitacionId}/rechazar/`);
 }
 
+export async function reenviarInvitacion(invitacionId) {
+  const { data } = await api.post(`/proyectos/invitaciones/${invitacionId}/reenviar/`);
+  return data;
+}
+
+export async function cancelarInvitacion(invitacionId) {
+  await api.delete(`/proyectos/invitaciones/${invitacionId}/`);
+}
+
 export async function duplicarProyecto(proyectoId) {
   const { data } = await api.post(`/proyectos/proyectos/${proyectoId}/duplicar/`);
   return { ...data, name: data.nombre || data.name };

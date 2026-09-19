@@ -17,7 +17,7 @@ export const createStarterDiagram = () => {
   proyecto.data.properties.push({ visibility: '+', name: 'nombre', type: 'String' }, { visibility: '+', name: 'direccion', type: 'String' });
   return {
     nodes: [usuario, proyecto],
-    edges: [{ id: 'usuario-proyecto', source: usuario.id, target: proyecto.id, type: 'relationEdge', data: { label: '@OneToMany', cardinality: '1 : N', multiplicidadOrigen: '1', multiplicidadDestino: 'N' } }],
+    edges: [{ id: 'usuario-proyecto', source: usuario.id, target: proyecto.id, type: 'relationEdge', data: { label: '@OneToMany', umlLabel: '', cardinality: '1 : N', multiplicidadOrigen: '1', multiplicidadDestino: 'N' } }],
   };
 };
 const relationMeta = { oneToMany: ['@OneToMany', '1 : N'], manyToOne: ['@ManyToOne', 'N : 1'], manyToMany: ['@ManyToMany', 'N : M'], oneToOne: ['@OneToOne', '1 : 1'] };
@@ -26,7 +26,7 @@ const useDiagramStore = create((set, get) => ({
   nodes: [], edges: [], selectedNodeId: null,
   onNodesChange: (changes) => set({ nodes: applyNodeChanges(changes, get().nodes) }),
   onEdgesChange: (changes) => set({ edges: applyEdgeChanges(changes, get().edges) }),
-  onConnect: (connection) => set({ edges: addEdge({ ...connection, id: `rel-${Date.now()}`, type: 'relationEdge', data: { label: '@OneToMany', cardinality: '1 : N', multiplicidadOrigen: '1', multiplicidadDestino: 'N' } }, get().edges) }),
+  onConnect: (connection) => set({ edges: addEdge({ ...connection, id: `rel-${Date.now()}`, type: 'relationEdge', data: { label: '@OneToMany', umlLabel: '', cardinality: '1 : N', multiplicidadOrigen: '1', multiplicidadDestino: 'N' } }, get().edges) }),
   selectNode: (id) => set({ selectedNodeId: id }),
   createNode: (kind, title, position) => { const node = makeNode(kind, title || 'NuevaEntidad', position || { x: 160 + Math.random() * 400, y: 120 + Math.random() * 280 }); set({ nodes: [...get().nodes, node], selectedNodeId: node.id }); return node; },
   updateNode: (id, patch) => set({ nodes: get().nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, ...patch } } : node) }),
@@ -38,7 +38,20 @@ const useDiagramStore = create((set, get) => ({
     set({ edges: get().edges.map((edge) => edge.id === id ? { ...edge, data: { ...edge.data, multiplicidadOrigen, multiplicidadDestino, cardinality: `${multiplicidadOrigen} : ${multiplicidadDestino}` } } : edge) });
     diagramMutationListener?.();
   },
-  createRelation: (type, source, target) => { if (!source || !target || source === target) return false; const [label, cardinality] = relationMeta[type] || relationMeta.oneToMany; const [multiplicidadOrigen, multiplicidadDestino] = cardinality.split(':').map((value) => value.trim()); set({ edges: [...get().edges, { id: `rel-${Date.now()}`, source, target, type: 'relationEdge', data: { label, cardinality, multiplicidadOrigen, multiplicidadDestino } }] }); return true; },
+  updateRelation: (id, { multiplicidadOrigen, multiplicidadDestino, umlLabel }) => {
+    set({ edges: get().edges.map((edge) => edge.id === id ? {
+      ...edge,
+      data: {
+        ...edge.data,
+        multiplicidadOrigen,
+        multiplicidadDestino,
+        umlLabel: umlLabel?.trim() || '',
+        cardinality: `${multiplicidadOrigen} : ${multiplicidadDestino}`,
+      },
+    } : edge) });
+    diagramMutationListener?.();
+  },
+  createRelation: (type, source, target) => { if (!source || !target || source === target) return false; const [label, cardinality] = relationMeta[type] || relationMeta.oneToMany; const [multiplicidadOrigen, multiplicidadDestino] = cardinality.split(':').map((value) => value.trim()); set({ edges: [...get().edges, { id: `rel-${Date.now()}`, source, target, type: 'relationEdge', data: { label, umlLabel: '', cardinality, multiplicidadOrigen, multiplicidadDestino } }] }); return true; },
   restore: (diagram = {}, { preserveSelection = false } = {}) => set((current) => {
     const nodes = diagram.nodes || [];
     const selectedNodeId = preserveSelection && nodes.some((node) => node.id === current.selectedNodeId)

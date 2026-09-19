@@ -11,7 +11,7 @@ import NewProjectDialog from './NewProjectDialog';
 import PeopleDialog from './PeopleDialog';
 import CollaboratorsDialog from '../collaboration/CollaboratorsDialog';
 import useDiagramStore, { createStarterDiagram, setDiagramMutationListener } from '../../stores/diagramStore';
-import { actualizarRolMiembro, contenidoDiagrama, crearDiagramaPrincipal, crearProyecto, eliminarColaborador, guardarDiagrama, invitarProyecto, listarProyectos, obtenerDiagramaPrincipal } from '../../api/diagramApi';
+import { actualizarRolMiembro, cancelarInvitacion, contenidoDiagrama, crearDiagramaPrincipal, crearProyecto, eliminarColaborador, guardarDiagrama, invitarProyecto, listarProyectos, obtenerDiagramaPrincipal, reenviarInvitacion } from '../../api/diagramApi';
 import { obtenerSesion } from '../../api/authApi';
 import { useDiagramSocket } from '../../hooks/useDiagramSocket';
 
@@ -38,6 +38,7 @@ export default function DiagramCanvas({ onLogout }) {
   const [shareOpen, setShareOpen] = useState(false);
   const [peopleOpen, setPeopleOpen] = useState(false);
   const [invite, setInvite] = useState('');
+  const [acceptedInvitationMember, setAcceptedInvitationMember] = useState(null);
   const [relationType, setRelationType] = useState(null);
   const [relationTarget, setRelationTarget] = useState('');
   const [toast, setToast] = useState('');
@@ -59,6 +60,21 @@ export default function DiagramCanvas({ onLogout }) {
   const onSocketMessage = useCallback((event) => {
     if (event?.type === 'presence.update') {
       setOnlineMembers(Array.isArray(event.miembros) ? event.miembros : Array.isArray(event.members) ? event.members : Array.isArray(event.users) ? event.users : []);
+      // Un colaborador que acepta la invitación entra a la sala. Recargamos el
+      // proyecto para moverlo de invitaciones_pendientes a miembros.
+      listarProyectos().then(setProjects).catch(() => {});
+      return;
+    }
+    if (event?.type === 'invitation.accepted' && String(event.proyecto_id) === String(activeProjectRef.current)) {
+      setProjects((items) => items.map((project) => {
+        if (String(project.id) !== String(event.proyecto_id)) return project;
+        const pending = (project.invitaciones_pendientes || []).filter((invitation) => String(invitation.id) !== String(event.invitacion_id));
+        const members = project.miembros || [];
+        const alreadyMember = members.some((member) => String(member.usuario?.id) === String(event.miembro?.usuario?.id));
+        return { ...project, invitaciones_pendientes: pending, miembros: alreadyMember || !event.miembro ? members : [...members, event.miembro] };
+      }));
+      setAcceptedInvitationMember(event.miembro || null);
+      setToast('Un colaborador aceptó la invitación y se unió al proyecto.');
       return;
     }
     if (event?.type === 'diagram.error') {
@@ -190,23 +206,30 @@ export default function DiagramCanvas({ onLogout }) {
 
   useEffect(() => {
     let mounted = true;
-    listarProyectos().then((items) => {
-      if (!mounted) return;
-      setProjects(items);
-      setLoading(false);
-      const savedProjectId = window.sessionStorage.getItem('diagramcraft-active-project');
-      const savedProject = items.find((project) => String(project.id) === savedProjectId);
-      if (savedProject) openProject(savedProject, false);
-      else restore(loadPrincipalDraft());
-    }).catch((requestError) => {
-      if (!mounted) return;
-      setError(requestError.response?.data?.detail || 'No se pudieron cargar tus proyectos.');
-      setLoading(false);
-    });
+    async function loadEditor() {
+      try {
+        // Confirma la cookie de sesión actual antes de pedir recursos privados.
+        const session = await obtenerSesion();
+        const user = session?.user || session;
+        if (!user?.id) throw new Error('No hay una sesión de usuario válida.');
+        const items = await listarProyectos();
+        if (!mounted) return;
+        setCurrentUser(user);
+        setProjects(items);
+        setLoading(false);
+        const savedProjectId = window.sessionStorage.getItem('diagramcraft-active-project');
+        const savedProject = items.find((project) => String(project.id) === savedProjectId);
+        if (savedProject) openProject(savedProject, false);
+        else restore(loadPrincipalDraft());
+      } catch (requestError) {
+        if (!mounted) return;
+        setError(requestError.response?.data?.detail || requestError.message || 'No se pudieron cargar tus proyectos.');
+        setLoading(false);
+      }
+    }
+    loadEditor();
     return () => { mounted = false; };
   }, [openProject, restore]);
-
-  useEffect(() => { obtenerSesion().then((session) => setCurrentUser(session?.user || session)).catch(() => setCurrentUser(null)); }, []);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -251,11 +274,28 @@ export default function DiagramCanvas({ onLogout }) {
     if (!invite.trim()) return;
     if (!activeProject) { setToast('Crea o selecciona un proyecto antes de invitar colaboradores.'); return; }
     try {
-      await invitarProyecto(activeProject.id, invite.trim(), rol);
-      setInvite(''); setShareOpen(false); setToast('Invitación enviada.');
+      const invitation = await invitarProyecto(activeProject.id, invite.trim(), rol);
+      const pendingInvitation = invitation.invitacion || invitation;
+      setProjects((items) => items.map((project) => project.id === activeProject.id ? { ...project, invitaciones_pendientes: [...(project.invitaciones_pendientes || []), pendingInvitation] } : project));
+      setInvite(''); setToast('Invitación enviada. Esperando aceptación.');
     } catch (requestError) {
       setToast(requestError.response?.data?.detail || 'No se pudo enviar la invitación.');
     }
+  };
+  const resendInvite = async (invitation) => {
+    try {
+      const updated = await reenviarInvitacion(invitation.id);
+      const renewedInvitation = updated.invitacion || updated;
+      setProjects((items) => items.map((project) => project.id === activeProject?.id ? { ...project, invitaciones_pendientes: (project.invitaciones_pendientes || []).map((item) => String(item.id) === String(invitation.id) ? { ...item, ...renewedInvitation } : item) } : project));
+      setToast('Invitación reenviada.');
+    } catch (requestError) { setToast(requestError.response?.data?.detail || 'No se pudo reenviar la invitación.'); }
+  };
+  const cancelInvite = async (invitation) => {
+    try {
+      await cancelarInvitacion(invitation.id);
+      setProjects((items) => items.map((project) => project.id === activeProject?.id ? { ...project, invitaciones_pendientes: (project.invitaciones_pendientes || []).filter((item) => String(item.id) !== String(invitation.id)) } : project));
+      setToast('Invitación cancelada.');
+    } catch (requestError) { setToast(requestError.response?.data?.detail || 'No se pudo cancelar la invitación.'); }
   };
   const changeMemberRole = async (member, rol) => {
     if (!activeProject) return;
@@ -300,7 +340,7 @@ export default function DiagramCanvas({ onLogout }) {
     {toast && <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded bg-[#18264a] px-4 py-3">{toast}</div>}
     {projectsOpen && <ProjectsDialog projects={projects} activeId={activeProjectId} onClose={() => setProjectsOpen(false)} onNew={createProject} onOpen={openProject} onLeaveProject={leaveProject} onRefresh={() => listarProyectos().then(setProjects)} />}
     {newProjectOpen && <NewProjectDialog name={projectName} setName={(name) => { setProjectName(name); setProjectNameError(''); }} error={projectNameError} onClose={() => setNewProjectOpen(false)} onCreate={confirmCreateProject} />}
-    {shareOpen && <CollaboratorsDialog project={activeProject} email={invite} setEmail={setInvite} onClose={() => setShareOpen(false)} onInvite={sendInvite} onChangeRole={changeMemberRole} onRemove={removeMember} currentUserId={currentUser?.id} canInvite={isOwner} canManage={isOwner} />}
+    {shareOpen && <CollaboratorsDialog project={activeProject} email={invite} setEmail={setInvite} onlineMembers={onlineMembers} acceptedMember={acceptedInvitationMember} onDismissAccepted={() => setAcceptedInvitationMember(null)} onClose={() => setShareOpen(false)} onInvite={sendInvite} onResendInvite={resendInvite} onCancelInvite={cancelInvite} onChangeRole={changeMemberRole} onRemove={removeMember} currentUserId={currentUser?.id} canInvite={isOwner} canManage={isOwner} />}
     {peopleOpen && <PeopleDialog members={onlineMembers} project={activeProject} onClose={() => setPeopleOpen(false)} />}
     {relationType && <RelationDialog nodes={nodes} type={relationType} target={relationTarget} setTarget={setRelationTarget} onClose={() => { setRelationType(null); setRelationTarget(''); }} onCreate={(source) => { if (createRelation(relationType, source, relationTarget)) { setRelationType(null); setRelationTarget(''); } }} />}
   </div>;
