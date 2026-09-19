@@ -25,6 +25,19 @@ export function useDiagramSocket(diagramId, onMessage) {
     return () => socket.close();
   }, [diagramId, onMessage]);
 
+  useEffect(() => {
+    if (!diagramId) return undefined;
+
+    const heartbeat = window.setInterval(() => {
+      const socket = socketRef.current;
+      if (socket?.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'presence.heartbeat', diagram_id: diagramId }));
+      }
+    }, 20000);
+
+    return () => window.clearInterval(heartbeat);
+  }, [diagramId]);
+
   const send = useCallback((event) => {
     if (socketRef.current?.readyState === WebSocket.OPEN) socketRef.current.send(JSON.stringify(event));
   }, []);

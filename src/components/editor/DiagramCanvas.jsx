@@ -56,8 +56,41 @@ export default function DiagramCanvas({ onLogout }) {
   const hasPendingChangesRef = useRef(false);
   const socketSyncTimerRef = useRef(null);
   const canEditRef = useRef(false);
+  const currentUserRef = useRef(null);
+  const leavingProjectRef = useRef(false);
+  const socketSendRef = useRef(null);
+
+  const returnToPrincipalCanvas = useCallback((message = 'Ya no tienes acceso a este proyecto.') => {
+    clearTimeout(saveTimerRef.current);
+    clearTimeout(socketSyncTimerRef.current);
+    if (activeDiagramRef.current) {
+      socketSendRef.current?.({ type: 'presence.leave', diagram_id: activeDiagramRef.current });
+    }
+    window.sessionStorage.removeItem('diagramcraft-active-project');
+    diagramLoadedRef.current = false;
+    activeProjectRef.current = null;
+    activeDiagramRef.current = null;
+    hasPendingChangesRef.current = false;
+    setActiveProjectId(null);
+    setActiveDiagramId(null);
+    setProjectsOpen(false);
+    setShareOpen(false);
+    setPeopleOpen(false);
+    setOnlineMembers([]);
+    setSaveStatus('local');
+    restore(loadPrincipalDraft());
+    setToast(message);
+  }, [restore]);
 
   const onSocketMessage = useCallback((event) => {
+    const removalEvents = ['member.removed', 'collaborator.removed', 'project.member.removed'];
+    if (removalEvents.includes(event?.type) && String(event.proyecto_id || event.project_id) === String(activeProjectRef.current)) {
+      const removedUserId = event.usuario_id || event.user_id || event.miembro?.usuario?.id || event.member?.usuario?.id;
+      if (removedUserId && String(removedUserId) === String(currentUserRef.current?.id)) {
+        returnToPrincipalCanvas(event.detail || 'El propietario te eliminó del proyecto. Volviste al lienzo principal.');
+      }
+      return;
+    }
     if (event?.type === 'presence.update') {
       setOnlineMembers(Array.isArray(event.miembros) ? event.miembros : Array.isArray(event.members) ? event.members : Array.isArray(event.users) ? event.users : []);
       // Un colaborador que acepta la invitación entra a la sala. Recargamos el
@@ -90,8 +123,13 @@ export default function DiagramCanvas({ onLogout }) {
       hasPendingChangesRef.current = false;
       setSaveStatus('saved');
     }
-  }, [restore]);
+  }, [restore, returnToPrincipalCanvas]);
   const { status: socketStatus, send: sendSocketEvent } = useDiagramSocket(activeDiagramId, onSocketMessage);
+
+  useEffect(() => {
+    socketSendRef.current = sendSocketEvent;
+    return () => { socketSendRef.current = null; };
+  }, [sendSocketEvent]);
 
   useEffect(() => {
     if (socketStatus === 'connected' && activeDiagramId) sendSocketEvent({ type: 'presence.join', diagram_id: activeDiagramId });
@@ -204,6 +242,12 @@ export default function DiagramCanvas({ onLogout }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [restore]);
 
+  const refreshProjects = useCallback(async () => {
+    const items = await listarProyectos();
+    setProjects(items);
+    return items;
+  }, []);
+
   useEffect(() => {
     let mounted = true;
     async function loadEditor() {
@@ -212,9 +256,10 @@ export default function DiagramCanvas({ onLogout }) {
         const session = await obtenerSesion();
         const user = session?.user || session;
         if (!user?.id) throw new Error('No hay una sesión de usuario válida.');
-        const items = await listarProyectos();
+        const items = await refreshProjects();
         if (!mounted) return;
         setCurrentUser(user);
+        currentUserRef.current = user;
         setProjects(items);
         setLoading(false);
         const savedProjectId = window.sessionStorage.getItem('diagramcraft-active-project');
@@ -229,7 +274,7 @@ export default function DiagramCanvas({ onLogout }) {
     }
     loadEditor();
     return () => { mounted = false; };
-  }, [openProject, restore]);
+  }, [openProject, refreshProjects, restore]);
 
   useEffect(() => {
     if (!toast) return undefined;
@@ -238,9 +283,59 @@ export default function DiagramCanvas({ onLogout }) {
   }, [toast]);
 
   const activeProject = projects.find((project) => project.id === activeProjectId);
+  const pendingInvitationCount = activeProject?.invitaciones_pendientes?.length || 0;
+  useEffect(() => {
+    if (!shareOpen || !activeProjectId) return undefined;
+
+    let mounted = true;
+    const refreshCollaborators = async () => {
+      try {
+        await refreshProjects();
+      } catch {
+        // El WebSocket sigue siendo el mecanismo inmediato. Esta recarga es
+        // una alternativa silenciosa cuando el backend no emite el evento.
+      }
+    };
+
+    refreshCollaborators();
+    if (!pendingInvitationCount) return () => { mounted = false; };
+
+    const interval = window.setInterval(() => {
+      if (mounted) refreshCollaborators();
+    }, 2500);
+    return () => {
+      mounted = false;
+      window.clearInterval(interval);
+    };
+  }, [activeProjectId, pendingInvitationCount, refreshProjects, shareOpen]);
   const currentMember = activeProject?.miembros?.find((member) => String(member.usuario?.id) === String(currentUser?.id));
   const currentRole = currentMember?.rol;
   const isOwner = currentRole === 'propietario' || String(activeProject?.propietario?.id || activeProject?.owner?.id) === String(currentUser?.id);
+  useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
+  useEffect(() => {
+    if (!activeProjectId || isOwner) return undefined;
+
+    let mounted = true;
+    const verifyProjectAccess = async () => {
+      try {
+        const items = await listarProyectos();
+        if (!mounted) return;
+        if (!items.some((project) => String(project.id) === String(activeProjectId))) {
+          returnToPrincipalCanvas('El propietario te eliminó del proyecto. Volviste al lienzo principal.');
+          return;
+        }
+        setProjects(items);
+      } catch {
+        // No expulsamos al usuario por un error temporal de red.
+      }
+    };
+
+    const interval = window.setInterval(verifyProjectAccess, 3000);
+    return () => {
+      mounted = false;
+      window.clearInterval(interval);
+    };
+  }, [activeProjectId, isOwner, returnToPrincipalCanvas]);
   // Fuera de un proyecto se permite el borrador local. Dentro de un proyecto,
   // solo los roles explícitos del backend habilitan edición.
   const canEdit = !activeProject || isOwner || ['propietario', 'arquitecto', 'editor'].includes(currentRole);
@@ -249,7 +344,7 @@ export default function DiagramCanvas({ onLogout }) {
   useEffect(() => { canEditRef.current = canEdit; }, [canEdit]);
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
   const createProject = () => { setProjectName(''); setProjectNameError(''); setNewProjectOpen(true); };
-  const leaveProject = async () => { clearTimeout(saveTimerRef.current); await persistPendingChanges(); window.sessionStorage.removeItem('diagramcraft-active-project'); diagramLoadedRef.current = false; activeProjectRef.current = null; activeDiagramRef.current = null; hasPendingChangesRef.current = false; setActiveProjectId(null); setActiveDiagramId(null); setSaveStatus('local'); restore(loadPrincipalDraft()); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
+  const leaveProject = async () => { clearTimeout(saveTimerRef.current); await persistPendingChanges(); if (activeDiagramRef.current) socketSendRef.current?.({ type: 'presence.leave', diagram_id: activeDiagramRef.current }); window.sessionStorage.removeItem('diagramcraft-active-project'); diagramLoadedRef.current = false; activeProjectRef.current = null; activeDiagramRef.current = null; hasPendingChangesRef.current = false; setActiveProjectId(null); setActiveDiagramId(null); setOnlineMembers([]); setSaveStatus('local'); restore(loadPrincipalDraft()); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
   const confirmCreateProject = async () => {
     const normalizedName = projectName.trim();
     if (!normalizedName) return;
@@ -313,6 +408,32 @@ export default function DiagramCanvas({ onLogout }) {
       setToast('Colaborador eliminado.');
     } catch (requestError) { setToast(requestError.response?.data?.detail || 'No se pudo eliminar el colaborador.'); }
   };
+  const leaveCollaboration = async (project) => {
+    if (!currentUser?.id || !project?.id) return;
+    if (leavingProjectRef.current) return;
+    leavingProjectRef.current = true;
+    try {
+      await eliminarColaborador(project.id, currentUser.id);
+    } catch (requestError) {
+      // Si el primer DELETE ya se completó, el segundo responde 404. La
+      // interfaz igualmente debe salir del proyecto porque ya no es miembro.
+      if (requestError.response?.status !== 404) {
+        setToast(requestError.response?.data?.detail || 'No se pudo abandonar el proyecto.');
+        return;
+      }
+    } finally {
+      leavingProjectRef.current = false;
+    }
+
+    try {
+      setProjects((items) => items.filter((item) => String(item.id) !== String(project.id)));
+      if (String(activeProjectId) === String(project.id)) {
+        returnToPrincipalCanvas('Abandonaste el proyecto. Volviste al lienzo principal.');
+      } else {
+        setToast('Abandonaste el proyecto.');
+      }
+    } catch { setToast('No se pudo actualizar el lienzo después de abandonar el proyecto.'); }
+  };
 
   if (loading) return <State message="Cargando proyectos…" />;
   if (error) return <State message={error} error />;
@@ -338,9 +459,9 @@ export default function DiagramCanvas({ onLogout }) {
     </header>
     <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar readOnly={isReadOnly} canUseRelations={canUseRelations} onlineMembers={onlineMembers} nodes={nodes} edges={edges} onCreate={(kind) => canEdit && createNode(kind)} onRelation={(type) => canUseRelations && setRelationType(type)} onCommand={() => {}} onListen={() => {}} onGenerate={() => {}} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow nodes={nodes} edges={edges} nodesDraggable={canEdit} nodesConnectable={canUseRelations} elementsSelectable={canEdit} onNodesChange={canEdit ? onNodesChange : undefined} onEdgesChange={canEdit ? onEdgesChange : undefined} onConnect={canUseRelations ? onConnect : undefined} onNodeClick={(_, node) => selectNode(node.id)} onPaneClick={() => selectNode(null)} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow>{canEdit && <PropertiesPanel node={selectedNode} onClose={() => selectNode(null)} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onDelete={() => deleteNode(selectedNode.id)} />}<div className={`absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] ${syncIndicator.color}`}>● {isReadOnly ? 'Modo solo lectura' : syncIndicator.label}</div></main></div>
     {toast && <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded bg-[#18264a] px-4 py-3">{toast}</div>}
-    {projectsOpen && <ProjectsDialog projects={projects} activeId={activeProjectId} onClose={() => setProjectsOpen(false)} onNew={createProject} onOpen={openProject} onLeaveProject={leaveProject} onRefresh={() => listarProyectos().then(setProjects)} />}
+    {projectsOpen && <ProjectsDialog projects={projects} activeId={activeProjectId} currentUserId={currentUser?.id} onClose={() => setProjectsOpen(false)} onNew={createProject} onOpen={openProject} onLeaveProject={leaveProject} onLeaveCollaboration={leaveCollaboration} onRefresh={() => listarProyectos().then(setProjects)} />}
     {newProjectOpen && <NewProjectDialog name={projectName} setName={(name) => { setProjectName(name); setProjectNameError(''); }} error={projectNameError} onClose={() => setNewProjectOpen(false)} onCreate={confirmCreateProject} />}
-    {shareOpen && <CollaboratorsDialog project={activeProject} email={invite} setEmail={setInvite} onlineMembers={onlineMembers} acceptedMember={acceptedInvitationMember} onDismissAccepted={() => setAcceptedInvitationMember(null)} onClose={() => setShareOpen(false)} onInvite={sendInvite} onResendInvite={resendInvite} onCancelInvite={cancelInvite} onChangeRole={changeMemberRole} onRemove={removeMember} currentUserId={currentUser?.id} canInvite={isOwner} canManage={isOwner} />}
+    {shareOpen && <CollaboratorsDialog project={activeProject} email={invite} setEmail={setInvite} onlineMembers={onlineMembers} acceptedMember={acceptedInvitationMember} onDismissAccepted={() => setAcceptedInvitationMember(null)} onClose={() => setShareOpen(false)} onInvite={sendInvite} onResendInvite={resendInvite} onCancelInvite={cancelInvite} onChangeRole={changeMemberRole} onRemove={removeMember} onViewCanvas={() => activeProject && openProject(activeProject)} currentUserId={currentUser?.id} canInvite={isOwner} canManage={isOwner} />}
     {peopleOpen && <PeopleDialog members={onlineMembers} project={activeProject} onClose={() => setPeopleOpen(false)} />}
     {relationType && <RelationDialog nodes={nodes} type={relationType} target={relationTarget} setTarget={setRelationTarget} onClose={() => { setRelationType(null); setRelationTarget(''); }} onCreate={(source) => { if (createRelation(relationType, source, relationTarget)) { setRelationType(null); setRelationTarget(''); } }} />}
   </div>;
