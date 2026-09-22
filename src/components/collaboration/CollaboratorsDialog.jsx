@@ -1,10 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { FiCheck, FiClock, FiCopy, FiEye, FiLink, FiMail, FiRefreshCw, FiSend, FiSliders, FiTrash2, FiUsers, FiX } from 'react-icons/fi';
+import { useEscapeClose } from '../../hooks/useEscapeClose';
 
 const roles = [{ value: 'editor', label: 'Editor de Diagrama' }, { value: 'arquitecto', label: 'Arquitecto' }, { value: 'lector', label: 'Solo lectura' }];
 const pendingInvitations = (project) => project?.invitaciones_pendientes || [];
 
 export default function CollaboratorsDialog({ project, email, setEmail, onlineMembers = [], acceptedMember, onDismissAccepted, onClose, onInvite, onResendInvite, onCancelInvite, onChangeRole, onRemove, onViewCanvas, currentUserId, canInvite, canManage }) {
+  useEscapeClose(true, onClose);
   const [role, setRole] = useState('editor');
   const [copied, setCopied] = useState(false);
   const roomLink = useMemo(() => `${window.location.origin}/proyecto/${project?.id || 'nuevo'}/live-canvas`, [project?.id]);

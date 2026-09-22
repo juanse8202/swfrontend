@@ -41,6 +41,17 @@ Use stable lowercase machine values and Spanish display labels. Migrate legacy D
 
 Keep UML semantics separate from JPA cardinality. Association, aggregation, composition, inheritance, realization, and dependency define the line/endpoint notation. `1`, `0..1`, `0..*`, and `1..*` define multiplicity. `@OneToMany` and similar annotations are derived JPA metadata, not UML relationship types.
 
+## Clases de asociación
+
+Una asociación que necesita atributos o métodos propios se modela como una **clase de asociación**, no como una relación `@ManyToMany` simple. Por ejemplo, `NotaVenta` y `Producto` pueden tener una relación muchos-a-muchos, mientras `DetalleVenta` conserva `cantidad` y `precio`.
+
+- Representa la clase de asociación (por ejemplo, `DetalleVenta`) como un nodo/clase normal, con un id estable; no sustituyas ni dupliques sus datos dentro de la arista.
+- Conserva la asociación base entre los dos nodos extremos y vincúlala con `data.associationClassNodeId`, cuyo valor es el id del nodo de clase de asociación.
+- Renderiza un conector UML discontinuo entre la arista de asociación base y el nodo `associationClassNodeId`. El conector expresa el vínculo UML y no reemplaza las multiplicidades, etiqueta ni anotaciones existentes de la arista.
+- Antes de crear o restaurar el vínculo, valida que la arista base, sus dos extremos y la clase de asociación pertenezcan al mismo diagrama. En el formato JSON actual, compruébalo contra el conjunto de `Diagrama.nodes` y `Diagrama.edges` del diagrama activo.
+- Mantén autoguardado, sincronización WebSocket, undo/redo, permisos de propietario/arquitecto y compatibilidad con diagramas que no tengan `associationClassNodeId`.
+- Al solicitar borrar la asociación base o cualquiera de sus nodos extremos, advierte que existe una clase de asociación vinculada. La advertencia debe identificar la clase afectada y dejar clara la acción elegida; no elimines nodos adicionales de forma implícita.
+
 ## Implementation requirements
 
 - Preserve project membership and role rules. Only owner/architect may modify relationships in a project.
