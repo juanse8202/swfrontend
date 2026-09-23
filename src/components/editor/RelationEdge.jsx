@@ -10,6 +10,10 @@ const quickValues = [
 ];
 
 function multiplicities(data) {
+  if (data?.xmiImported) return [
+    (data.multiplicidadOrigen || '').replace('N', '*'),
+    (data.multiplicidadDestino || '').replace('N', '*'),
+  ];
   if (data?.multiplicidadOrigen || data?.multiplicidadDestino) return [(data.multiplicidadOrigen || '1').replace('N', '*'), (data.multiplicidadDestino || '*').replace('N', '*')];
   const [source = '1', target = '*'] = (data?.cardinality || '1 : *').replace(/[()]/g, '').split(':').map((value) => value.trim().replace('N', '*'));
   return [source, target];
@@ -35,6 +39,18 @@ function anchorForPoint(bounds, point) {
   ];
   const { side, offset } = candidates.reduce((closest, candidate) => candidate.distance < closest.distance ? candidate : closest);
   return { side, offset };
+}
+
+// UML cardinalities belong to their association end, not to a percentage of
+// the complete line. A fixed short offset keeps them beside the class when a
+// relationship crosses a large canvas.
+function pointNearEndpoint(from, to, preferredOffset = 28) {
+  const dx = to.x - from.x;
+  const dy = to.y - from.y;
+  const length = Math.hypot(dx, dy);
+  if (!length) return from;
+  const offset = Math.min(preferredOffset, length * 0.25);
+  return { x: from.x + (dx / length) * offset, y: from.y + (dy / length) * offset };
 }
 
 const markerName = (edgeId, name) => `uml-${String(edgeId).replace(/[^a-zA-Z0-9_-]/g, '-')}-${name}`;
@@ -106,8 +122,8 @@ export default function RelationEdge({ id, source, target, sourceX, sourceY, tar
   };
   const apply = () => {
     useDiagramStore.getState().updateRelation(id, {
-      multiplicidadOrigen: sourceMultiplicity || '1',
-      multiplicidadDestino: targetMultiplicity || '*',
+      multiplicidadOrigen: sourceMultiplicity || '',
+      multiplicidadDestino: targetMultiplicity || '',
       umlLabel,
       ownerNodeId,
       wholeNodeId,
@@ -148,10 +164,12 @@ export default function RelationEdge({ id, source, target, sourceX, sourceY, tar
   const targetAnchor = dragAnchors?.target || data?.targetAnchor;
   const sourcePoint = pointForAnchor(data?.sourceBounds, sourceAnchor, { x: sourceX, y: sourceY });
   const targetPoint = pointForAnchor(data?.targetBounds, targetAnchor, { x: targetX, y: targetY });
-  const origenX = sourcePoint.x + (targetPoint.x - sourcePoint.x) * 0.12;
-  const origenY = sourcePoint.y + (targetPoint.y - sourcePoint.y) * 0.12;
-  const destinoX = sourcePoint.x + (targetPoint.x - sourcePoint.x) * 0.88;
-  const destinoY = sourcePoint.y + (targetPoint.y - sourcePoint.y) * 0.88;
+  const sourceLabelPoint = pointNearEndpoint(sourcePoint, targetPoint);
+  const targetLabelPoint = pointNearEndpoint(targetPoint, sourcePoint);
+  const origenX = sourceLabelPoint.x;
+  const origenY = sourceLabelPoint.y;
+  const destinoX = targetLabelPoint.x;
+  const destinoY = targetLabelPoint.y;
   const [edgePath, labelX, labelY] = getBezierPath({ sourceX: sourcePoint.x, sourceY: sourcePoint.y, sourcePosition: sourceAnchor ? positionForSide(sourceAnchor.side) : sourcePosition, targetX: targetPoint.x, targetY: targetPoint.y, targetPosition: targetAnchor ? positionForSide(targetAnchor.side) : targetPosition });
   const startAnchorDrag = (which, event) => {
     if (!data?.canManage || event.button !== 0) return;
@@ -200,8 +218,8 @@ export default function RelationEdge({ id, source, target, sourceX, sourceY, tar
       <circle cx={labelX} cy={labelY} r="4" fill="#080f21" stroke="#a5b4fc" strokeWidth="1.5" pointerEvents="none" />
     </>}
     <EdgeLabelRenderer>
-      <button onClick={(event) => openEditorFor('source', event)} style={{ position: 'absolute', transform: `translate(-50%, -50%) translate(${origenX}px, ${origenY}px)`, pointerEvents: 'all' }} className="nodrag nopan rounded border border-cyan-300/50 bg-[#101a31] px-1.5 py-0.5 font-mono text-[10px] font-bold text-cyan-200 shadow hover:bg-cyan-500/20">{savedSource}</button>
-      <button onClick={(event) => openEditorFor('target', event)} style={{ position: 'absolute', transform: `translate(-50%, -50%) translate(${destinoX}px, ${destinoY}px)`, pointerEvents: 'all' }} className="nodrag nopan rounded border border-violet-300/50 bg-[#101a31] px-1.5 py-0.5 font-mono text-[10px] font-bold text-violet-200 shadow hover:bg-violet-500/20">{savedTarget}</button>
+      {savedSource && <button onClick={(event) => openEditorFor('source', event)} style={{ position: 'absolute', transform: `translate(-50%, -50%) translate(${origenX}px, ${origenY}px)`, pointerEvents: 'all' }} className="nodrag nopan rounded border border-cyan-300/50 bg-[#101a31] px-1.5 py-0.5 font-mono text-[10px] font-bold text-cyan-200 shadow hover:bg-cyan-500/20">{savedSource}</button>}
+      {savedTarget && <button onClick={(event) => openEditorFor('target', event)} style={{ position: 'absolute', transform: `translate(-50%, -50%) translate(${destinoX}px, ${destinoY}px)`, pointerEvents: 'all' }} className="nodrag nopan rounded border border-violet-300/50 bg-[#101a31] px-1.5 py-0.5 font-mono text-[10px] font-bold text-violet-200 shadow hover:bg-violet-500/20">{savedTarget}</button>}
       <div style={{ position: 'absolute', transform: `translate(-50%, -50%) translate(${labelX}px, ${labelY}px)`, pointerEvents: 'all' }} className="nodrag nopan">
         <button aria-label="Editar relación UML" onClick={(event) => openEditorFor('target', event)} className="flex items-center gap-1 rounded-full border border-surface-variant bg-surface-container-high px-3 py-1.5 font-code-mono text-[11px] font-bold text-tertiary shadow-lg hover:border-indigo-400"><span className="material-symbols-outlined text-[14px]">link</span>{data?.umlLabel || null}</button>
         {open && createPortal(<section style={{ backgroundColor: '#0b1430', opacity: 1, left: panelPosition.x, top: panelPosition.y }} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); apply(); } }} className="fixed z-[9999] w-[390px] overflow-hidden rounded-2xl border-2 border-indigo-400/60 p-4 text-left text-xs text-slate-200 shadow-[0_0_35px_rgba(99,102,241,0.35)]">

@@ -54,6 +54,17 @@ export function generarSpringBoot(diagramaId) {
   return api.post(`/diagramas/diagramas/${diagramaId}/generar-spring-boot/`, {}, { responseType: 'arraybuffer' });
 }
 
+export function exportarXmi(diagramaId) {
+  return api.get(`/diagramas/diagramas/${diagramaId}/exportar-xmi/`, { responseType: 'arraybuffer' });
+}
+
+export function importarXmi(diagramaId, file) {
+  const form = new FormData();
+  form.append('file', file);
+  form.append('mode', 'replace');
+  return api.post(`/diagramas/diagramas/${diagramaId}/importar-xmi/`, form);
+}
+
 export async function obtenerDiagramaPrincipal(proyecto) {
   const embedded = proyecto.diagrama_principal || proyecto.diagramaPrincipal;
   if (embedded && belongsToProject(embedded, proyecto.id)) return embedded;

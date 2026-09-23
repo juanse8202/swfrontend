@@ -73,7 +73,11 @@ const normalizeRelationEdge = (edge) => {
   const relationType = legacyRelationTypes[data.relationType] || data.relationType || 'asociacion';
   const meta = relationMeta[relationType] || relationMeta.asociacion;
   const [defaultSourceMultiplicity, defaultTargetMultiplicity] = meta.cardinality.split(':').map((value) => value.trim());
-  const normalizeMultiplicity = (value, fallback) => value === 'N' ? '*' : value || fallback;
+  const normalizeMultiplicity = (value, fallback) => {
+    if (value === 'N') return '*';
+    if (value !== undefined && value !== null) return value;
+    return data.xmiImported ? '' : fallback;
+  };
   const needsTargetWholeMigration = (relationType === 'agregacion' || relationType === 'composicion') && data.relationConvention !== targetWholeConvention;
   return {
     ...edge,
