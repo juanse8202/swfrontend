@@ -13,7 +13,7 @@ import PeopleDialog from './PeopleDialog';
 import CollaboratorsDialog from '../collaboration/CollaboratorsDialog';
 import { useEscapeClose } from '../../hooks/useEscapeClose';
 import useDiagramStore, { createStarterDiagram, setDiagramMutationListener } from '../../stores/diagramStore';
-import { actualizarRolMiembro, cancelarInvitacion, contenidoDiagrama, crearDiagramaPrincipal, crearProyecto, eliminarColaborador, guardarDiagrama, invitarProyecto, listarProyectos, obtenerDiagramaPrincipal, reenviarInvitacion } from '../../api/diagramApi';
+import { actualizarRolMiembro, cancelarInvitacion, contenidoDiagrama, crearDiagramaPrincipal, crearProyecto, eliminarColaborador, generarSpringBoot, guardarDiagrama, invitarProyecto, listarProyectos, obtenerDiagramaPrincipal, reenviarInvitacion } from '../../api/diagramApi';
 import { obtenerSesion } from '../../api/authApi';
 import { useDiagramSocket } from '../../hooks/useDiagramSocket';
 
@@ -21,6 +21,15 @@ const nodeTypes = { umlClass: ClassNode };
 const edgeTypes = { relationEdge: RelationEdge };
 const principalDraftKey = 'diagramcraft-principal-draft';
 const relationLabels = { asociacion: 'Asociación', agregacion: 'Agregación', composicion: 'Composición', herencia: 'Herencia', realizacion: 'Realización', dependencia: 'Dependencia' };
+const classNodeKinds = new Set(['class', 'entity']);
+const isClassNode = (node) => classNodeKinds.has(node?.data?.kind || 'entity');
+const isAllowedRelation = (type, source, target) => {
+  if (!source || !target || source.id === target.id) return false;
+  if (type === 'realizacion') return isClassNode(source) && target.data?.kind === 'interface';
+  if (type === 'herencia') return isClassNode(source) && isClassNode(target);
+  if (['asociacion', 'agregacion', 'composicion'].includes(type)) return source.data?.kind === 'entity' && target.data?.kind === 'entity';
+  return true;
+};
 
 const anchorPoint = (bounds, anchor, fallbackSide) => {
   if (!bounds) return null;
@@ -76,6 +85,28 @@ function loadPrincipalDraft() {
   try { return JSON.parse(window.sessionStorage.getItem(principalDraftKey)) || createStarterDiagram(); } catch { return createStarterDiagram(); }
 }
 
+const readGenerationError = (payload) => {
+  if (payload instanceof ArrayBuffer) {
+    try { return JSON.parse(new TextDecoder().decode(payload)); } catch { return {}; }
+  }
+  return payload || {};
+};
+const generationIssues = (payload, fallback) => {
+  const body = readGenerationError(payload);
+  const raw = body.errors || body.errores || body.detail || body.message || body;
+  const item = (value, extra = {}) => {
+    if (typeof value === 'string') return { message: value, ...extra };
+    return { message: value?.message || value?.mensaje || value?.detail || 'El modelo UML tiene un error de validación.', node_id: value?.node_id || value?.nodeId || extra.node_id, edge_id: value?.edge_id || value?.edgeId || extra.edge_id };
+  };
+  if (Array.isArray(raw)) return raw.map((value) => item(value));
+  if (typeof raw === 'object' && raw) return Object.entries(raw).flatMap(([key, value]) => (Array.isArray(value) ? value.map((entry) => item(entry, { field: key })) : [item(value, { field: key })]));
+  return [item(fallback || 'No se pudo generar el proyecto.')];
+};
+const zipFilename = (header) => {
+  const match = /filename\*?=(?:UTF-8''|")?([^;"]+)/i.exec(header || '');
+  try { return match?.[1] ? decodeURIComponent(match[1].replace(/["]/g, '')) : 'spring-boot-project.zip'; } catch { return 'spring-boot-project.zip'; }
+};
+
 export default function DiagramCanvas({ onLogout }) {
   const store = useDiagramStore();
   const { nodes, edges, selectedNodeId, onNodesChange: applyNodesChange, onEdgesChange: applyEdgesChange, syncRelationHandles, reconnectRelation: reconnectStoreRelation, updateRelationAnchors: persistRelationAnchors, selectNode, createNode: addNode, createRelation: addRelation, updateNode: patchNode, addAttribute: appendAttribute, updateAttribute: patchAttribute, removeAttribute: deleteAttribute, addMethod: appendMethod, updateMethod: patchMethod, removeMethod: deleteMethod, duplicateNode: copyNode, setNodePositionLocked, deleteNode: removeNode, deleteRelation: removeRelation, createAssociationClassNode, clearAssociationClassNode, undo, redo, restore } = store;
@@ -105,6 +136,9 @@ export default function DiagramCanvas({ onLogout }) {
   const [editorPosition, setEditorPosition] = useState(null);
   const [relationMenu, setRelationMenu] = useState(null);
   const [relationAnchorPreview, setRelationAnchorPreview] = useState({});
+  const [generating, setGenerating] = useState(false);
+  const [generationErrors, setGenerationErrors] = useState([]);
+  const [highlightedEdgeId, setHighlightedEdgeId] = useState(null);
   const savingRef = useRef(false);
   const saveTimerRef = useRef(null);
   const saveQueuedRef = useRef(false);
@@ -119,6 +153,7 @@ export default function DiagramCanvas({ onLogout }) {
   const leavingProjectRef = useRef(false);
   const socketSendRef = useRef(null);
   const scheduleCurrentSaveRef = useRef(null);
+  const reactFlowRef = useRef(null);
 
   const returnToPrincipalCanvas = useCallback((message = 'Ya no tienes acceso a este proyecto.') => {
     clearTimeout(saveTimerRef.current);
@@ -198,9 +233,9 @@ export default function DiagramCanvas({ onLogout }) {
     if (socketStatus === 'connected' && activeDiagramId) sendSocketEvent({ type: 'presence.join', diagram_id: activeDiagramId });
   }, [activeDiagramId, sendSocketEvent, socketStatus]);
 
-  async function persistPendingChanges() {
-    if (!diagramLoadedRef.current || !activeProjectRef.current || !hasPendingChangesRef.current) return;
-    if (savingRef.current) { saveQueuedRef.current = true; return; }
+  async function persistPendingChanges({ silent = false } = {}) {
+    if (!diagramLoadedRef.current || !activeProjectRef.current || !hasPendingChangesRef.current) return true;
+    if (savingRef.current) { saveQueuedRef.current = true; return false; }
     savingRef.current = true;
     setSaveStatus('saving');
     const contenido = diagramStateRef.current;
@@ -214,9 +249,11 @@ export default function DiagramCanvas({ onLogout }) {
       }
       hasPendingChangesRef.current = false;
       setSaveStatus('saved');
+      return true;
     } catch (requestError) {
       setSaveStatus('error');
-      setToast(requestError.response?.data?.detail || 'No se pudo guardar el diagrama.');
+      if (!silent) setToast(requestError.response?.data?.detail || 'No se pudo guardar el diagrama.');
+      return false;
     } finally {
       savingRef.current = false;
       if (saveQueuedRef.current) {
@@ -275,7 +312,7 @@ export default function DiagramCanvas({ onLogout }) {
     setPendingConnection({ source: connection.source, target: connection.target });
   };
   const createNode = (...args) => { const node = addNode(...args); scheduleCurrentSave(); return node; };
-  const createRelation = (...args) => { const created = addRelation(...args); if (created) scheduleCurrentSave(); return created; };
+  const createRelation = (...args) => { const [type, sourceId, targetId] = args; const source = nodes.find((node) => node.id === sourceId); const target = nodes.find((node) => node.id === targetId); if (!isAllowedRelation(type, source, target)) { setToast(['asociacion', 'agregacion', 'composicion'].includes(type) ? 'Las relaciones JPA solo se permiten entre entidades.' : type === 'realizacion' ? 'La realización debe ir de una clase o entidad hacia una interface.' : 'La herencia debe ir de una clase o entidad hija hacia una clase o entidad padre.'); return false; } const created = addRelation(...args); if (created) scheduleCurrentSave(); return created; };
   const updateNode = (...args) => { patchNode(...args); scheduleCurrentSave(); };
   const addAttribute = (...args) => { appendAttribute(...args); scheduleCurrentSave(); };
   const updateAttribute = (...args) => { patchAttribute(...args); scheduleCurrentSave(); };
@@ -447,6 +484,71 @@ export default function DiagramCanvas({ onLogout }) {
   const canUseRelations = !activeProject || isOwner || ['propietario', 'arquitecto'].includes(currentRole);
   useEffect(() => { canEditRef.current = canEdit; }, [canEdit]);
   const selectedNode = nodes.find((node) => node.id === selectedNodeId);
+  const focusGenerationIssue = (issue) => {
+    const nodeReference = issue?.node_id || issue?.element_id;
+    if (nodeReference && nodes.some((node) => String(node.id) === String(nodeReference))) {
+      const nodeId = nodes.find((node) => String(node.id) === String(nodeReference)).id;
+      selectNode(nodeId);
+      setEditorPosition(null);
+      setHighlightedEdgeId(null);
+      reactFlowRef.current?.fitView({ nodes: [{ id: nodeId }], padding: 0.7, duration: 350 });
+      return;
+    }
+    const edgeReference = issue?.edge_id || issue?.element_id;
+    if (edgeReference && edges.some((edge) => String(edge.id) === String(edgeReference))) {
+      selectNode(null);
+      setEditorPosition(null);
+      const edge = edges.find((item) => String(item.id) === String(edgeReference));
+      setHighlightedEdgeId(edge.id);
+      reactFlowRef.current?.fitView({ nodes: [{ id: edge.source }, { id: edge.target }], padding: 0.7, duration: 350 });
+    }
+  };
+  const validateForGeneration = () => {
+    const byId = new Map(nodes.map((node) => [node.id, node]));
+    return edges.flatMap((edge) => {
+      const source = byId.get(edge.source);
+      const target = byId.get(edge.target);
+      const type = edge.data?.relationType || 'asociacion';
+      if (type === 'realizacion' && (!source || !target || source.data?.kind === 'interface' || target.data?.kind !== 'interface')) return [{ edge_id: edge.id, message: 'La realización debe ir desde una clase hacia una interface.' }];
+      if (type === 'herencia' && (!source || !target || source.id === target.id || source.data?.kind === 'interface' || target.data?.kind === 'interface')) return [{ edge_id: edge.id, message: 'La herencia debe ir de una clase hija a una clase padre diferente.' }];
+      if (['asociacion', 'agregacion', 'composicion'].includes(type) && (!source || !target || source.data?.kind !== 'entity' || target.data?.kind !== 'entity')) return [{ edge_id: edge.id, message: 'Las relaciones JPA solo pueden conectar dos entidades.' }];
+      return [];
+    });
+  };
+  const generateSpringBoot = async () => {
+    if (generating) return;
+    if (!activeDiagramId) { setGenerationErrors([{ message: 'No hay un diagrama guardado activo para generar el proyecto.' }]); return; }
+    if (isReadOnly) { setGenerationErrors([{ message: 'No tienes permisos de edición para generar este proyecto.' }]); return; }
+    const localIssues = validateForGeneration();
+    if (localIssues.length) { setGenerationErrors(localIssues); focusGenerationIssue(localIssues[0]); return; }
+    scheduleCurrentSave();
+    const saved = await persistPendingChanges({ silent: true });
+    if (!saved) { setGenerationErrors([{ message: 'No se pudieron guardar los cambios pendientes. Corrige el guardado antes de generar.' }]); return; }
+    setGenerating(true);
+    setGenerationErrors([]);
+    setHighlightedEdgeId(null);
+    try {
+      const response = await generarSpringBoot(activeDiagramId);
+      const blob = new Blob([response.data], { type: response.headers['content-type'] || 'application/zip' });
+      const url = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = zipFilename(response.headers['content-disposition']);
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(url), 0);
+      setToast('Proyecto Spring Boot descargado correctamente.');
+    } catch (requestError) {
+      const status = requestError.response?.status;
+      const fallback = status === 403 ? 'No tienes permisos para generar este proyecto.' : status === 404 ? 'El diagrama ya no existe.' : status >= 500 ? 'El servidor no pudo generar el proyecto. Inténtalo nuevamente.' : !requestError.response ? 'No se pudo conectar con el servidor.' : 'No se pudo generar el proyecto.';
+      const issues = generationIssues(requestError.response?.data, fallback);
+      setGenerationErrors(issues);
+      focusGenerationIssue(issues[0]);
+    } finally {
+      setGenerating(false);
+    }
+  };
   const requestDeleteNode = useCallback((id) => { setNodeMenu(null); setDeleteCandidate(nodes.find((node) => node.id === id) || null); }, [nodes]);
   const openNodeMenu = useCallback((id, x, y) => {
     if (!canUseRelations) return;
@@ -632,7 +734,7 @@ export default function DiagramCanvas({ onLogout }) {
       x: (associationClassNode.positionAbsolute?.x ?? associationClassNode.position.x) + (associationClassNode.width || 250) / 2,
       y: (associationClassNode.positionAbsolute?.y ?? associationClassNode.position.y) + (associationClassNode.height || 110) / 2,
     } : null;
-    return { ...edge, data: { ...edge.data, sourceAnchor: relationAnchorPreview[edge.id]?.source || edge.data?.sourceAnchor, targetAnchor: relationAnchorPreview[edge.id]?.target || edge.data?.targetAnchor, sourceBounds: boundsFor(sourceNode), targetBounds: boundsFor(targetNode), associationClassPosition, crossings: relationJumps[edge.id] || [], canManage: canUseRelations, onOpenMenu: (x, y) => openRelationMenu(edge.id, x, y) } };
+    return { ...edge, data: { ...edge.data, sourceAnchor: relationAnchorPreview[edge.id]?.source || edge.data?.sourceAnchor, targetAnchor: relationAnchorPreview[edge.id]?.target || edge.data?.targetAnchor, sourceBounds: boundsFor(sourceNode), targetBounds: boundsFor(targetNode), associationClassPosition, crossings: relationJumps[edge.id] || [], highlighted: highlightedEdgeId === edge.id, canManage: canUseRelations, onOpenMenu: (x, y) => openRelationMenu(edge.id, x, y) } };
   });
   const syncIndicator = {
     local: { label: 'Borrador local', color: 'text-slate-300' },
@@ -650,10 +752,11 @@ export default function DiagramCanvas({ onLogout }) {
       <button onClick={createProject} className="flex shrink-0 items-center gap-1 rounded-lg bg-indigo-600 px-3 py-2 text-xs font-bold text-white hover:bg-indigo-500"><FiPlus /> Nuevo Proyecto</button>
       <div className="ml-auto hidden min-w-0 flex-1 rounded-full border border-indigo-400/30 bg-[#0d162d] px-3 py-2 text-[10px] text-indigo-100 xl:block"><FiZap className="mr-1 inline text-indigo-400" />Voz/IA: <i>“Crea entidad Pedido con relación 1:N a Detalle”</i><span className="ml-2 rounded bg-indigo-900/60 px-1.5 py-0.5 font-mono text-[9px] text-indigo-300">Spacebar</span></div>
       <button onClick={() => setPeopleOpen(true)} title={visibleOnlineMembers.map((member) => member.usuario?.username || member.username || member.email || 'Usuario').join(', ') || 'Sin colaboradores conectados'} className="hidden shrink-0 items-center gap-2 rounded-lg border border-slate-600 bg-[#131d36] px-3 py-2 text-xs font-bold hover:bg-slate-700 lg:flex"><span className="flex -space-x-1">{visibleOnlineMembers.map((member, index) => { const user = member.usuario || member; const name = user.username || user.email || 'U'; const colors = ['bg-indigo-600', 'bg-emerald-600', 'bg-sky-500']; return <i key={user.id || name} className={`grid h-6 w-6 place-items-center rounded-full border-2 border-[#091124] ${colors[index]} text-[8px] not-italic`}>{name.slice(0, 2).toUpperCase()}</i>; })}{visibleOnlineMembers.length === 0 && <i className="grid h-6 w-6 place-items-center rounded-full border-2 border-[#091124] bg-slate-600 text-[8px] not-italic">—</i>}</span><span className="text-[9px] text-emerald-300">{onlineMembers.length}<br /><span className="text-slate-400">en línea</span></span></button>
-      <div className="ml-1 flex shrink-0 gap-1"><button onClick={() => setShareOpen(true)} className="flex items-center gap-1 rounded-lg bg-gradient-to-r from-indigo-600 to-violet-600 px-3 py-2.5 text-[11px] font-bold text-white hover:from-indigo-500 hover:to-violet-500"><FiShare2 /> Compartir / Invitar</button><button onClick={() => setToast('Importación XMI disponible al conectar la persistencia del diagrama.')} className="flex items-center gap-1 rounded-lg border border-slate-600 bg-[#131d36] px-2.5 py-2.5 text-[11px] font-medium hover:bg-slate-700"><FiUpload /> Importar</button><button onClick={() => setToast('Exportación XMI disponible al conectar la persistencia del diagrama.')} className="flex items-center gap-1 rounded-lg border border-slate-600 bg-[#131d36] px-2.5 py-2.5 text-[11px] font-medium hover:bg-slate-700"><FiDownload /> XMI (EA)</button><button onClick={() => setToast('Generador de 4 capas listo para los nodos del diagrama.')} className="flex items-center gap-1 rounded-lg bg-indigo-500 px-3 py-2.5 text-[11px] font-bold text-white hover:bg-indigo-400"><FiZap className="text-yellow-200" /> Generar 4 Capas</button><button onClick={onLogout} title="Cerrar sesión" className="rounded-lg bg-rose-600 p-2.5 text-white hover:bg-rose-500"><FiLogOut /></button></div>
+      <div className="ml-1 flex shrink-0 gap-1"><button onClick={() => setShareOpen(true)} className="flex items-center gap-1 rounded-lg bg-gradient-to-r from-indigo-600 to-violet-600 px-3 py-2.5 text-[11px] font-bold text-white hover:from-indigo-500 hover:to-violet-500"><FiShare2 /> Compartir / Invitar</button><button onClick={() => setToast('Importación XMI disponible al conectar la persistencia del diagrama.')} className="flex items-center gap-1 rounded-lg border border-slate-600 bg-[#131d36] px-2.5 py-2.5 text-[11px] font-medium hover:bg-slate-700"><FiUpload /> Importar</button><button onClick={() => setToast('Exportación XMI disponible al conectar la persistencia del diagrama.')} className="flex items-center gap-1 rounded-lg border border-slate-600 bg-[#131d36] px-2.5 py-2.5 text-[11px] font-medium hover:bg-slate-700"><FiDownload /> XMI (EA)</button><button onClick={generateSpringBoot} disabled={generating || isReadOnly || !activeDiagramId} className="flex items-center gap-1 rounded-lg bg-indigo-500 px-3 py-2.5 text-[11px] font-bold text-white hover:bg-indigo-400 disabled:cursor-wait disabled:opacity-55"><FiZap className="text-yellow-200" /> {generating ? 'Generando…' : 'Generar 4 Capas'}</button><button onClick={onLogout} title="Cerrar sesión" className="rounded-lg bg-rose-600 p-2.5 text-white hover:bg-rose-500"><FiLogOut /></button></div>
     </header>
-    <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar readOnly={isReadOnly} canUseRelations={canUseRelations} onlineMembers={onlineMembers} nodes={nodes} edges={edges} onCreate={(kind) => canEdit && createNode(kind)} onRelation={(type) => canUseRelations && setRelationType(type)} onCommand={() => {}} onListen={() => {}} onGenerate={() => {}} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow nodes={canvasNodes} edges={canvasEdges} nodesDraggable={canEdit} nodesConnectable={canUseRelations} connectionMode={ConnectionMode.Loose} elementsSelectable={canEdit} onNodesChange={canEdit ? onNodesChange : undefined} onEdgesChange={canEdit ? onEdgesChange : undefined} onConnect={canUseRelations ? onConnect : undefined} onReconnect={canUseRelations ? reconnectRelation : undefined} onNodeClick={(event, node) => { setNodeMenu(null); setRelationMenu(null); selectNode(node.id); setEditorPosition({ x: event.clientX, y: event.clientY }); }} onPaneClick={() => { selectNode(null); setNodeMenu(null); setRelationMenu(null); }} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow>{canUseRelations && <PropertiesPanel node={selectedNode} position={editorPosition} onClose={() => { selectNode(null); setEditorPosition(null); }} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onAddMethod={() => addMethod(selectedNode.id)} onUpdateMethod={(index, value) => updateMethod(selectedNode.id, index, value)} onRemoveMethod={(index) => removeMethod(selectedNode.id, index)} onDelete={() => requestDeleteNode(selectedNode.id)} />}<div className={`absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] ${syncIndicator.color}`}>● {isReadOnly ? 'Modo solo lectura' : syncIndicator.label}</div></main></div>
+    <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar readOnly={isReadOnly} canUseRelations={canUseRelations} onlineMembers={onlineMembers} nodes={nodes} edges={edges} generating={generating} onCreate={(kind) => canEdit && createNode(kind)} onRelation={(type) => canUseRelations && setRelationType(type)} onCommand={() => {}} onListen={() => {}} onGenerate={generateSpringBoot} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow onInit={(instance) => { reactFlowRef.current = instance; }} nodes={canvasNodes} edges={canvasEdges} nodesDraggable={canEdit} nodesConnectable={canUseRelations} connectionMode={ConnectionMode.Loose} elementsSelectable={canEdit} onNodesChange={canEdit ? onNodesChange : undefined} onEdgesChange={canEdit ? onEdgesChange : undefined} onConnect={canUseRelations ? onConnect : undefined} onReconnect={canUseRelations ? reconnectRelation : undefined} onNodeClick={(event, node) => { setNodeMenu(null); setRelationMenu(null); selectNode(node.id); setEditorPosition({ x: event.clientX, y: event.clientY }); }} onPaneClick={() => { selectNode(null); setNodeMenu(null); setRelationMenu(null); }} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow>{canUseRelations && <PropertiesPanel node={selectedNode} position={editorPosition} onClose={() => { selectNode(null); setEditorPosition(null); }} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onAddMethod={() => addMethod(selectedNode.id)} onUpdateMethod={(index, value) => updateMethod(selectedNode.id, index, value)} onRemoveMethod={(index) => removeMethod(selectedNode.id, index)} onDelete={() => requestDeleteNode(selectedNode.id)} />}<div className={`absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] ${syncIndicator.color}`}>● {isReadOnly ? 'Modo solo lectura' : syncIndicator.label}</div></main></div>
     {toast && <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded bg-[#18264a] px-4 py-3">{toast}</div>}
+    {generationErrors.length > 0 && <GenerationErrorDialog errors={generationErrors} onClose={() => { setGenerationErrors([]); setHighlightedEdgeId(null); }} onFocus={focusGenerationIssue} />}
     {projectsOpen && <ProjectsDialog projects={projects} activeId={activeProjectId} currentUserId={currentUser?.id} onClose={() => setProjectsOpen(false)} onNew={createProject} onOpen={openProject} onLeaveProject={leaveProject} onLeaveCollaboration={leaveCollaboration} onRefresh={() => listarProyectos().then(setProjects)} />}
     {newProjectOpen && <NewProjectDialog name={projectName} setName={(name) => { setProjectName(name); setProjectNameError(''); }} error={projectNameError} onClose={() => setNewProjectOpen(false)} onCreate={confirmCreateProject} />}
     {shareOpen && <CollaboratorsDialog project={activeProject} email={invite} setEmail={setInvite} onlineMembers={onlineMembers} acceptedMember={acceptedInvitationMember} onDismissAccepted={() => setAcceptedInvitationMember(null)} onClose={() => setShareOpen(false)} onInvite={sendInvite} onResendInvite={resendInvite} onCancelInvite={cancelInvite} onChangeRole={changeMemberRole} onRemove={removeMember} onViewCanvas={() => activeProject && openProject(activeProject)} currentUserId={currentUser?.id} canInvite={isOwner} canManage={isOwner} />}
@@ -669,10 +772,28 @@ export default function DiagramCanvas({ onLogout }) {
 }
 
 function State({ message, detail, action, error, children }) { return <div className={`grid h-screen place-items-center bg-[#070c1a] p-6 text-center ${error ? 'text-rose-300' : 'text-slate-200'}`}><div><h1 className="text-xl font-bold text-white">{message}</h1>{detail && <p className="mt-2 text-slate-400">{detail}</p>}{action && <button onClick={action} className="mt-5 rounded-lg bg-indigo-600 px-4 py-3 font-bold"><FiPlus className="mr-1 inline" /> Crear proyecto</button>}{children}</div></div>; }
+function GenerationErrorDialog({ errors, onClose, onFocus }) {
+  useEscapeClose(true, onClose);
+  return <div className="fixed inset-0 z-[10001] grid place-items-center bg-slate-950/60 p-5" onMouseDown={onClose}><section role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()} className="max-h-[80vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-rose-400/50 bg-[#101a31] p-5 shadow-2xl"><header className="flex items-start justify-between gap-4"><div><h2 className="text-lg font-extrabold text-rose-200">No se pudo generar el proyecto</h2><p className="mt-1 text-sm text-slate-400">Corrige los elementos indicados y vuelve a intentarlo.</p></div><button onClick={onClose} className="rounded p-1 text-slate-400 hover:bg-slate-700 hover:text-white">×</button></header><ul className="mt-4 space-y-2">{errors.map((issue, index) => <li key={`${issue.message}-${index}`} className="rounded-lg border border-slate-700 bg-[#091124] p-3"><p className="text-sm text-slate-100">{issue.message}</p>{issue.field && <small className="mt-1 block font-mono text-slate-400">{issue.field}</small>}{(issue.node_id || issue.edge_id || issue.element_id) && <button onClick={() => onFocus(issue)} className="mt-2 text-xs font-bold text-cyan-300 hover:text-cyan-100">Ver elemento en el diagrama</button>}</li>)}</ul><button onClick={onClose} className="mt-5 w-full rounded-lg border border-slate-600 py-2 font-bold text-slate-200 hover:bg-slate-700">Cerrar</button></section></div>;
+}
 function NodeContextMenu({ node, position, onClose, onEdit, onDuplicate, onToggleLock, onDelete }) { useEscapeClose(Boolean(node), onClose); if (!node) return null; return <div className="fixed inset-0 z-[10000]" onMouseDown={onClose}><section role="menu" onMouseDown={(event) => event.stopPropagation()} style={{ left: Math.min(position.x, window.innerWidth - 300), top: Math.min(position.y, window.innerHeight - 280) }} className="fixed w-72 rounded-2xl border border-slate-500/45 bg-[#2a344f] p-3 text-slate-100 shadow-2xl"><div className="mb-2 flex justify-between px-2 text-[10px] font-bold uppercase tracking-wide text-slate-300"><span>Acciones de clase</span><span>Proyecto</span></div><button onClick={onEdit} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left font-bold hover:bg-slate-600/50"><FiEdit3 className="text-violet-200" />Editar campos y métodos</button><button onClick={onDuplicate} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left font-bold hover:bg-slate-600/50"><FiCopy className="text-violet-200" />Duplicar nodo</button><button onClick={onToggleLock} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left font-bold hover:bg-slate-600/50">{node.data.positionLocked ? <FiUnlock className="text-cyan-200" /> : <FiLock className="text-cyan-200" />}{node.data.positionLocked ? 'Desbloquear posición' : 'Bloquear posición'}</button><div className="mt-2 rounded-xl bg-rose-950/45 p-1"><button onClick={onDelete} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left font-bold text-rose-200 hover:bg-rose-900/40"><FiTrash2 />Eliminar clase del diagrama</button></div></section></div>; }
 function RelationContextMenu({ position, onClose, onDelete }) { useEscapeClose(true, onClose); return <div className="fixed inset-0 z-[10000]" onMouseDown={onClose}><section role="menu" onMouseDown={(event) => event.stopPropagation()} style={{ left: Math.min(position.x, window.innerWidth - 240), top: Math.min(position.y, window.innerHeight - 100) }} className="fixed w-56 rounded-xl border border-slate-500/45 bg-[#2a344f] p-2 shadow-2xl"><button onClick={onDelete} className="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-left text-sm font-bold text-rose-200 hover:bg-rose-900/40"><FiTrash2 />Eliminar relación</button></section></div>; }
 function DeleteNodeConfirmation({ node, relationCount, onClose, onConfirm }) { useEscapeClose(true, onClose); return <div role="dialog" aria-modal="true" className="fixed inset-0 z-[80] grid place-items-center bg-black/70 p-4"><section className="w-full max-w-md rounded-2xl border border-rose-400/50 bg-[#101a31] p-5 shadow-2xl"><h2 className="text-lg font-bold text-white">¿Eliminar nodo de clase?</h2><p className="mt-2 text-sm text-slate-300">Se eliminará “{node.data.title}” y {relationCount} relación{relationCount === 1 ? '' : 'es'} conectada{relationCount === 1 ? '' : 's'}.</p><div className="mt-6 flex justify-end gap-3"><button onClick={onClose} className="rounded-lg border border-slate-600 px-4 py-2">Cancelar</button><button onClick={onConfirm} className="rounded-lg bg-rose-600 px-4 py-2 font-bold text-white">Eliminar</button></div></section></div>; }
-function RelationDialog({ nodes, type, target, setTarget, onClose, onCreate }) { const [source, setSource] = useState(nodes[0]?.id || ''); const label = relationLabels[type] || type; return <Modal title={`Crear relación UML: ${label}`} onClose={onClose}><select value={source} onChange={(event) => setSource(event.target.value)} className="w-full rounded bg-slate-800 p-2">{nodes.map((node) => <option key={node.id} value={node.id}>{node.data.title}</option>)}</select><select value={target} onChange={(event) => setTarget(event.target.value)} className="mt-3 w-full rounded bg-slate-800 p-2"><option value="">Destino</option>{nodes.map((node) => <option key={node.id} value={node.id}>{node.data.title}</option>)}</select><button onClick={() => onCreate(source)} className="mt-4 w-full rounded bg-indigo-600 p-2">Crear {label}</button></Modal>; }
+function RelationDialog({ nodes, type, target, setTarget, onClose, onCreate }) {
+  const sourceCandidates = nodes.filter((node) => type === 'realizacion' || type === 'herencia' ? isClassNode(node) : true);
+  const [source, setSource] = useState(sourceCandidates[0]?.id || '');
+  const sourceNode = nodes.find((node) => node.id === source);
+  const targetCandidates = nodes.filter((node) => isAllowedRelation(type, sourceNode, node));
+  const targetNode = nodes.find((node) => node.id === target);
+  const canCreate = isAllowedRelation(type, sourceNode, targetNode);
+  const label = relationLabels[type] || type;
+  const hint = type === 'realizacion'
+    ? 'La realización requiere una clase que implemente una interfaz.'
+    : type === 'herencia'
+      ? 'La herencia requiere una clase hija y una clase padre.'
+      : null;
+  return <Modal title={`Crear relación UML: ${label}`} onClose={onClose}>{hint && <p className="mb-3 text-xs text-indigo-200">{hint}</p>}<select value={source} onChange={(event) => { setSource(event.target.value); setTarget(''); }} className="w-full rounded bg-slate-800 p-2">{sourceCandidates.map((node) => <option key={node.id} value={node.id}>{node.data.title}</option>)}</select><select value={target} onChange={(event) => setTarget(event.target.value)} className="mt-3 w-full rounded bg-slate-800 p-2"><option value="">Destino</option>{targetCandidates.map((node) => <option key={node.id} value={node.id}>{node.data.title}</option>)}</select><button disabled={!canCreate} onClick={() => onCreate(source)} className="mt-4 w-full rounded bg-indigo-600 p-2 disabled:cursor-not-allowed disabled:opacity-40">Crear {label}</button></Modal>;
+}
 function AssociationClassDialog({ edge, nodes, onClose, onLink }) {
   useEscapeClose(Boolean(edge), onClose);
   if (!edge) return null;
@@ -715,7 +836,7 @@ function ConnectionRelationDialog({ nodes, connection, onClose, onCreate }) {
     <section className="w-full max-w-lg rounded-2xl border border-indigo-400/50 bg-[#101a31] p-5 shadow-2xl">
       <div className="flex items-start justify-between gap-4"><div><h2 className="text-lg font-bold text-white">Elegir relación UML</h2><p className="mt-1 text-sm text-slate-400">{source?.data.title || 'Clase origen'} <span className="text-indigo-300">→</span> {target?.data.title || 'Clase destino'}</p></div><button onClick={onClose} aria-label="Cancelar conexión" className="rounded p-1 text-slate-400 hover:bg-slate-700 hover:text-white"><FiX /></button></div>
       <p className="mt-4 text-xs text-slate-300">Selecciona el tipo de relación que deseas crear.</p>
-      <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">{options.map(([type, label, detail]) => <button key={type} onClick={() => onCreate(type)} className="rounded-xl border border-slate-600 bg-[#0b1430] p-3 text-left transition hover:border-indigo-400 hover:bg-indigo-500/15"><b className="block text-sm text-white">{label}</b><span className="mt-1 block text-[11px] text-slate-400">{detail}</span></button>)}</div>
+      <div className="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">{options.map(([type, label, detail]) => { const allowed = isAllowedRelation(type, source, target); return <button key={type} disabled={!allowed} title={allowed ? detail : 'Este origen y destino no son válidos para esta relación UML.'} onClick={() => onCreate(type)} className="rounded-xl border border-slate-600 bg-[#0b1430] p-3 text-left transition hover:border-indigo-400 hover:bg-indigo-500/15 disabled:cursor-not-allowed disabled:opacity-35"><b className="block text-sm text-white">{label}</b><span className="mt-1 block text-[11px] text-slate-400">{detail}</span></button>; })}</div>
       <button onClick={onClose} className="mt-4 w-full rounded-lg border border-slate-600 px-4 py-2 text-sm font-medium text-slate-200 hover:bg-slate-700">Cancelar</button>
     </section>
   </div>;

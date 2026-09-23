@@ -48,6 +48,12 @@ export async function guardarDiagrama(diagramaId, contenido) {
   return data;
 }
 
+// El servidor genera exclusivamente desde Diagrama.nodes y Diagrama.edges ya
+// persistidos. Se solicita binario para recibir el ZIP sin transformaciones.
+export function generarSpringBoot(diagramaId) {
+  return api.post(`/diagramas/diagramas/${diagramaId}/generar-spring-boot/`, {}, { responseType: 'arraybuffer' });
+}
+
 export async function obtenerDiagramaPrincipal(proyecto) {
   const embedded = proyecto.diagrama_principal || proyecto.diagramaPrincipal;
   if (embedded && belongsToProject(embedded, proyecto.id)) return embedded;

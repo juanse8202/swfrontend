@@ -92,16 +92,31 @@ const normalizeRelationEdge = (edge) => {
   };
 };
 
-const colors = { entity: ['bg-indigo-600', 'text-white', 'text-cyan-300'], dto: ['bg-violet-600', 'text-white', 'text-violet-200'], enum: ['bg-amber-600', 'text-white', 'text-amber-200'], embeddable: ['bg-cyan-700', 'text-white', 'text-cyan-200'] };
+const colors = { entity: ['bg-indigo-600', 'text-white', 'text-cyan-300'], dto: ['bg-violet-600', 'text-white', 'text-violet-200'], enum: ['bg-amber-600', 'text-white', 'text-amber-200'], embeddable: ['bg-cyan-700', 'text-white', 'text-cyan-200'], interface: ['bg-fuchsia-700', 'text-white', 'text-fuchsia-200'], class: ['bg-slate-600', 'text-white', 'text-slate-200'] };
+const stereotypes = { entity: '@Entity', dto: 'DTO / Record', enum: 'enum', embeddable: '@Embeddable', interface: '<<interface>>', class: 'Class' };
+const classKinds = new Set(['class', 'entity']);
+const isClassNode = (node) => classKinds.has(node?.data?.kind || 'entity');
+const canConnectRelation = (relationType, sourceNode, targetNode) => {
+  if (!sourceNode || !targetNode || sourceNode.id === targetNode.id) return false;
+  if (relationType === 'realizacion') return isClassNode(sourceNode) && targetNode.data?.kind === 'interface';
+  if (relationType === 'herencia') return isClassNode(sourceNode) && isClassNode(targetNode);
+  if (['asociacion', 'agregacion', 'composicion'].includes(relationType)) return sourceNode.data?.kind === 'entity' && targetNode.data?.kind === 'entity';
+  return true;
+};
 const appearanceFor = (kind) => {
   const [headerBg, headerText, methodColor] = colors[kind] || colors.entity;
-  const stereotypes = { entity: '@Entity', dto: 'DTO / Record', enum: 'enum', embeddable: '@Embeddable' };
-  return { kind, stereotype: stereotypes[kind] || '@Entity', icon: kind === 'enum' ? 'format_list_bulleted' : kind === 'dto' ? 'description' : 'account_tree', headerBg, headerText, methodColor };
+  return { kind, stereotype: stereotypes[kind] || '@Entity', icon: kind === 'enum' ? 'format_list_bulleted' : kind === 'dto' ? 'description' : kind === 'interface' ? 'settings_ethernet' : 'account_tree', headerBg, headerText, methodColor };
+};
+const dataForKind = (kind, data) => {
+  if (!kind) return {};
+  if (kind === 'interface') return { ...appearanceFor(kind), abstract: true, properties: [] };
+  if (kind === 'enum') return { ...appearanceFor(kind), abstract: false, properties: [], methods: [], literals: data.literals || [] };
+  if (kind === 'dto' || kind === 'embeddable') return { ...appearanceFor(kind), abstract: false, methods: [] };
+  if (kind === 'entity') return { ...appearanceFor(kind), persistent: data.persistent ?? true };
+  return { ...appearanceFor(kind), abstract: Boolean(data.abstract) };
 };
 const makeNode = (kind = 'entity', title = 'NuevaEntidad', position = { x: 180, y: 160 }) => {
-  const [headerBg, headerText, methodColor] = colors[kind] || colors.entity;
-  const stereotypes = { entity: '@Entity', dto: 'DTO / Record', enum: 'enum', embeddable: '@Embeddable' };
-  return { id: `${kind}-${crypto.randomUUID?.() || Date.now()}`, type: 'umlClass', position, data: { kind, title: title.endsWith('.java') ? title : `${title}.java`, stereotype: stereotypes[kind] || '@Entity', icon: kind === 'enum' ? 'format_list_bulleted' : kind === 'dto' ? 'description' : 'account_tree', headerBg, headerText, methodColor, properties: kind === 'entity' ? [{ visibility: '#', name: 'id', type: 'UUID (@Id)' }] : [], methods: [] } };
+  return { id: `${kind}-${crypto.randomUUID?.() || Date.now()}`, type: 'umlClass', position, data: { ...appearanceFor(kind), title: title.endsWith('.java') ? title : `${title}.java`, abstract: kind === 'interface', persistent: kind === 'entity', literals: kind === 'enum' ? [] : undefined, properties: kind === 'entity' ? [{ visibility: '#', name: 'id', type: 'UUID (@Id)', id: true }] : [], methods: [] } };
 };
 const associationClassNodeFor = (state, edge) => {
   const source = state.nodes.find((node) => node.id === edge.source);
@@ -170,9 +185,9 @@ const useDiagramStore = create((set, get) => ({
     let updated = false;
     set((state) => {
       const edge = state.edges.find((item) => item.id === id);
-      const sourceExists = state.nodes.some((node) => node.id === connection.source);
-      const targetExists = state.nodes.some((node) => node.id === connection.target);
-      if (!edge || !sourceExists || !targetExists || connection.source === connection.target) return {};
+      const sourceNode = state.nodes.find((node) => node.id === connection.source);
+      const targetNode = state.nodes.find((node) => node.id === connection.target);
+      if (!edge || !canConnectRelation(edge.data?.relationType || 'asociacion', sourceNode, targetNode)) return {};
       updated = true;
       const associationClassIsEndpoint = edge.data?.associationClassNodeId === connection.source || edge.data?.associationClassNodeId === connection.target;
       return {
@@ -199,7 +214,7 @@ const useDiagramStore = create((set, get) => ({
   },
   selectNode: (id) => set({ selectedNodeId: id }),
   createNode: (kind, title, position) => { const node = makeNode(kind, title || 'NuevaEntidad', position || { x: 160 + Math.random() * 400, y: 120 + Math.random() * 280 }); set((state) => ({ ...historyPatch(state), nodes: [...state.nodes, node], selectedNodeId: null })); return node; },
-  updateNode: (id, patch) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, ...patch, ...(patch.kind ? appearanceFor(patch.kind) : {}) } } : node) })),
+  updateNode: (id, patch) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, ...patch, ...dataForKind(patch.kind, { ...node.data, ...patch }) } } : node) })),
   addAttribute: (id) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, properties: [...node.data.properties, { visibility: '+', name: 'nuevoAtributo', type: 'String' }] } } : node) })),
   updateAttribute: (id, index, patch) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, properties: node.data.properties.map((p, i) => i === index ? { ...p, ...patch } : p) } } : node) })),
   removeAttribute: (id, index) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, properties: node.data.properties.filter((_, i) => i !== index) } } : node) })),
@@ -302,7 +317,9 @@ const useDiagramStore = create((set, get) => ({
     diagramMutationListener?.();
   },
   createRelation: (type, source, target) => {
-    if (!source || !target || source === target) return false;
+    const sourceNode = get().nodes.find((node) => node.id === source);
+    const targetNode = get().nodes.find((node) => node.id === target);
+    if (!source || !target || !canConnectRelation(legacyRelationTypes[type] || type, sourceNode, targetNode)) return false;
     const relationType = legacyRelationTypes[type] || type;
     const meta = relationMeta[relationType] || relationMeta.asociacion;
     const [multiplicidadOrigen, multiplicidadDestino] = meta.cardinality.split(':').map((value) => value.trim());
@@ -321,7 +338,12 @@ const useDiagramStore = create((set, get) => ({
   restore: (diagram = {}, { preserveSelection = false } = {}) => {
     let migrated = false;
     set((current) => {
-      const nodes = diagram.nodes || [];
+      const nodes = (diagram.nodes || []).map((node) => {
+        const kind = node.data?.kind || 'entity';
+        const data = { ...node.data, ...appearanceFor(kind), kind, abstract: node.data?.abstract ?? kind === 'interface', properties: node.data?.properties || [], methods: node.data?.methods || [] };
+        if (kind === 'enum') data.literals = node.data?.literals || [];
+        return { ...node, data };
+      });
       const normalizedEdges = (diagram.edges || []).map((edge) => {
         const normalized = normalizeRelationEdge(edge);
         migrated ||= normalized.source !== edge.source || normalized.target !== edge.target || normalized.sourceHandle !== edge.sourceHandle || normalized.targetHandle !== edge.targetHandle || normalized.data.relationConvention !== edge.data?.relationConvention;

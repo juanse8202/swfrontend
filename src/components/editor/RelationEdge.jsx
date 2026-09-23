@@ -130,6 +130,7 @@ export default function RelationEdge({ id, sourceX, sourceY, targetX, targetY, s
   const relationType = data?.relationType || 'asociacion';
   const notation = notationFor(relationType, id, fallbackMarkerEnd);
   const { markerStart, markerEnd, ...edgeStyle } = notation;
+  const renderedEdgeStyle = data?.highlighted ? { ...edgeStyle, ...style, stroke: '#fbbf24', strokeWidth: 3 } : { ...edgeStyle, ...style };
   const crossings = data?.crossings || [];
   const crossingMaskId = `uml-crossing-mask-${String(id).replace(/[^a-zA-Z0-9_-]/g, '-')}`;
   const associationClassPosition = relationType === 'asociacion' ? data?.associationClassPosition : null;
@@ -176,9 +177,9 @@ export default function RelationEdge({ id, sourceX, sourceY, targetX, targetY, s
   return <>
     <UmlMarkers edgeId={id} />
     {crossings.length > 0 && <defs><mask id={crossingMaskId} maskUnits="userSpaceOnUse" x="-100000" y="-100000" width="200000" height="200000"><rect x="-100000" y="-100000" width="200000" height="200000" fill="white" />{crossings.map((crossing, index) => <circle key={`${crossing.x}-${crossing.y}-${index}`} cx={crossing.x} cy={crossing.y} r="12" fill="black" />)}</mask></defs>}
-    <path d={edgePath} fill="none" className="react-flow__edge-path" markerStart={markerStart} markerEnd={markerEnd} mask={crossings.length > 0 ? `url(#${crossingMaskId})` : undefined} style={{ ...edgeStyle, ...style }} />
+    <path d={edgePath} fill="none" className="react-flow__edge-path" markerStart={markerStart} markerEnd={markerEnd} mask={crossings.length > 0 ? `url(#${crossingMaskId})` : undefined} style={renderedEdgeStyle} />
     {crossings.map((crossing, index) => <g key={`${crossing.x}-${crossing.y}-${index}`} transform={`translate(${crossing.x} ${crossing.y}) rotate(${crossing.angle})`} pointerEvents="none">
-      <path d="M -11 0 Q 0 -10 11 0" fill="none" stroke={edgeStyle.stroke || '#8083ff'} strokeWidth={edgeStyle.strokeWidth || 2} strokeDasharray={edgeStyle.strokeDasharray} />
+      <path d="M -11 0 Q 0 -10 11 0" fill="none" stroke={renderedEdgeStyle.stroke || '#8083ff'} strokeWidth={renderedEdgeStyle.strokeWidth || 2} strokeDasharray={renderedEdgeStyle.strokeDasharray} />
     </g>)}
     {data?.canManage && <path d={edgePath} fill="none" stroke="transparent" strokeWidth="18" pointerEvents="stroke" onContextMenu={(event) => { event.preventDefault(); event.stopPropagation(); data.onOpenMenu?.(event.clientX, event.clientY); }} />}
     {data?.canManage && <>
