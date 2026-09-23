@@ -15,6 +15,7 @@ import { useEscapeClose } from '../../hooks/useEscapeClose';
 import useDiagramStore, { createStarterDiagram, setDiagramMutationListener } from '../../stores/diagramStore';
 import { actualizarRolMiembro, cancelarInvitacion, contenidoDiagrama, crearDiagramaPrincipal, crearProyecto, eliminarColaborador, exportarXmi, generarSpringBoot, guardarDiagrama, importarXmi, invitarProyecto, listarProyectos, obtenerDiagramaPrincipal, reenviarInvitacion } from '../../api/diagramApi';
 import { obtenerSesion } from '../../api/authApi';
+import { applyAiPlan, interpretAi } from '../../api/aiApi';
 import { useDiagramSocket } from '../../hooks/useDiagramSocket';
 
 const nodeTypes = { umlClass: ClassNode };
@@ -142,6 +143,10 @@ export default function DiagramCanvas({ onLogout }) {
   const [xmiReport, setXmiReport] = useState(null);
   const [generationErrors, setGenerationErrors] = useState([]);
   const [highlightedEdgeId, setHighlightedEdgeId] = useState(null);
+  const [aiCommand, setAiCommand] = useState('');
+  const [aiStatus, setAiStatus] = useState('inactivo');
+  const [aiMessage, setAiMessage] = useState('');
+  const [aiPlan, setAiPlan] = useState(null);
   const savingRef = useRef(false);
   const saveTimerRef = useRef(null);
   const saveQueuedRef = useRef(false);
@@ -158,6 +163,12 @@ export default function DiagramCanvas({ onLogout }) {
   const scheduleCurrentSaveRef = useRef(null);
   const reactFlowRef = useRef(null);
   const xmiInputRef = useRef(null);
+  const aiRequestRef = useRef(0);
+  const aiAbortRef = useRef(null);
+  const speechRecognitionRef = useRef(null);
+  const speechTranscriptRef = useRef('');
+  const aiEchoRef = useRef(null);
+  const diagramRevisionRef = useRef(null);
 
   const returnToPrincipalCanvas = useCallback((message = 'Ya no tienes acceso a este proyecto.') => {
     clearTimeout(saveTimerRef.current);
@@ -216,6 +227,11 @@ export default function DiagramCanvas({ onLogout }) {
     }
     if (event?.type !== 'diagram.update' || String(event.diagram_id) !== String(activeDiagramRef.current)) return;
     if (Array.isArray(event.nodes) && Array.isArray(event.edges)) {
+      const incoming = JSON.stringify({ nodes: event.nodes, edges: event.edges });
+      if (aiEchoRef.current && incoming === aiEchoRef.current) {
+        aiEchoRef.current = null;
+        return;
+      }
       // restore escribe directamente nodes/edges en el store, equivalente a
       // setNodes(event.nodes) y setEdges(event.edges) de React Flow.
       const migrated = restore({ nodes: event.nodes, edges: event.edges }, { preserveSelection: true });
@@ -297,6 +313,132 @@ export default function DiagramCanvas({ onLogout }) {
     }
     scheduleSave();
   }
+
+  const isCurrentAiRequest = (requestId, diagramId) => requestId === aiRequestRef.current && String(diagramId) === String(activeDiagramRef.current);
+  const aiSelection = () => ({ node_ids: selectedNodeId ? [selectedNodeId] : [], edge_ids: highlightedEdgeId ? [highlightedEdgeId] : [] });
+  const applyAuthoritativeAiResult = (payload, diagramId) => {
+    const document = payload?.diagram || payload?.result || payload;
+    if (!Array.isArray(document?.nodes) || !Array.isArray(document?.edges) || String(diagramId) !== String(activeDiagramRef.current)) return false;
+    clearTimeout(saveTimerRef.current);
+    clearTimeout(socketSyncTimerRef.current);
+    saveQueuedRef.current = false;
+    const viewport = reactFlowRef.current?.getViewport?.();
+    restore({ nodes: document.nodes, edges: document.edges }, { preserveSelection: true, recordHistory: true });
+    const restored = useDiagramStore.getState();
+    diagramStateRef.current = { nodes: restored.nodes, edges: restored.edges };
+    hasPendingChangesRef.current = false;
+    diagramRevisionRef.current = document.revision ?? document.version ?? payload?.revision ?? payload?.version ?? diagramRevisionRef.current;
+    aiEchoRef.current = JSON.stringify(diagramStateRef.current);
+    setSaveStatus('saved');
+    window.requestAnimationFrame(() => { if (viewport) reactFlowRef.current?.setViewport?.(viewport); });
+    return true;
+  };
+  const applyCurrentAiPlan = async (plan, confirm = true) => {
+    const diagramId = activeDiagramRef.current;
+    if (!plan?.plan_id || !diagramId) return;
+    const requestId = ++aiRequestRef.current;
+    aiAbortRef.current?.abort();
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+    setAiStatus('aplicando');
+    setAiMessage('Aplicando el plan autorizado…');
+    try {
+      const { data } = await applyAiPlan(diagramId, {
+        plan_id: plan.plan_id,
+        idempotency_key: crypto.randomUUID?.() || `ai-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        confirm,
+      }, { signal: controller.signal });
+      if (!isCurrentAiRequest(requestId, diagramId)) return;
+      if (!applyAuthoritativeAiResult(data, diagramId)) throw new Error('El servidor no devolvió un diagrama autorizado.');
+      setAiPlan(null);
+      setAiStatus('exito');
+      setAiMessage(data?.summary || data?.message || 'Instrucción aplicada correctamente.');
+      setToast('El Agente IA actualizó el diagrama.');
+    } catch (requestError) {
+      if (requestError.code === 'ERR_CANCELED' || !isCurrentAiRequest(requestId, diagramId)) return;
+      setAiStatus('error');
+      setAiMessage(requestError.response?.data?.detail || requestError.response?.data?.message || 'No se pudo aplicar el plan; el lienzo no fue modificado.');
+    } finally {
+      if (isCurrentAiRequest(requestId, diagramId)) aiAbortRef.current = null;
+    }
+  };
+  const interpretAiCommand = async (instruction) => {
+    const diagramId = activeDiagramRef.current;
+    if (!instruction?.trim()) { setAiStatus('error'); setAiMessage('Escribe una instrucción antes de enviarla.'); return; }
+    if (!diagramId) { setAiStatus('error'); setAiMessage('Selecciona un diagrama guardado antes de usar el Agente IA.'); return; }
+    if (isReadOnly) { setAiStatus('error'); setAiMessage('No tienes permiso para modificar este diagrama.'); return; }
+    clearTimeout(saveTimerRef.current);
+    const saved = await persistPendingChanges({ silent: true });
+    if (!saved || String(diagramId) !== String(activeDiagramRef.current)) { setAiStatus('error'); setAiMessage('No se pudieron sincronizar los cambios pendientes antes de interpretar.'); return; }
+    const requestId = ++aiRequestRef.current;
+    aiAbortRef.current?.abort();
+    const controller = new AbortController();
+    aiAbortRef.current = controller;
+    setAiStatus('interpretando');
+    setAiMessage('Interpretando la instrucción…');
+    setAiPlan(null);
+    try {
+      const { data } = await interpretAi(diagramId, instruction.trim(), aiSelection(), { signal: controller.signal });
+      if (!isCurrentAiRequest(requestId, diagramId)) return;
+      const status = String(data?.status || data?.type || data?.kind || 'ready').toLowerCase();
+      if (status === 'clarification' || status === 'aclaracion') {
+        const candidates = (data?.candidates || []).map((candidate) => candidate.name || candidate.title || candidate.id).filter(Boolean);
+        setAiStatus('aclaracion');
+        setAiMessage(`${data?.question || data?.message || 'Necesito una aclaración.'}${candidates.length ? ` Opciones: ${candidates.join(', ')}.` : ''}`);
+        return;
+      }
+      if (status === 'unsupported' || status === 'error') {
+        setAiStatus('error');
+        setAiMessage(data?.message || data?.detail || 'Esta instrucción no está soportada.');
+        return;
+      }
+      const plan = data?.plan || data;
+      const normalizedPlan = { ...plan, plan_id: plan.plan_id || plan.id || data?.plan_id, summary: plan.summary || data?.summary || data?.message || 'Plan listo para aplicar.' };
+      if (!normalizedPlan.plan_id) throw new Error('La respuesta no contiene un plan aplicable.');
+      if (data?.requires_confirmation || plan?.requires_confirmation) {
+        setAiPlan(normalizedPlan);
+        setAiStatus('confirmacion');
+        setAiMessage(normalizedPlan.summary);
+        return;
+      }
+      await applyCurrentAiPlan(normalizedPlan, true);
+    } catch (requestError) {
+      if (requestError.code === 'ERR_CANCELED' || !isCurrentAiRequest(requestId, diagramId)) return;
+      setAiStatus('error');
+      setAiMessage(requestError.response?.data?.detail || requestError.response?.data?.message || requestError.message || 'No se pudo interpretar la instrucción.');
+    } finally {
+      if (isCurrentAiRequest(requestId, diagramId)) aiAbortRef.current = null;
+    }
+  };
+  const cancelAi = () => { aiRequestRef.current += 1; aiAbortRef.current?.abort(); aiAbortRef.current = null; setAiPlan(null); setAiStatus('inactivo'); setAiMessage(''); };
+  const toggleVoiceRecognition = () => {
+    const ActiveRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (speechRecognitionRef.current) { speechRecognitionRef.current.abort(); speechRecognitionRef.current = null; setAiStatus('inactivo'); setAiMessage('Reconocimiento de voz detenido.'); return; }
+    if (!ActiveRecognition) { setAiStatus('error'); setAiMessage('Este navegador no admite reconocimiento de voz. Puedes escribir la instrucción.'); return; }
+    const recognition = new ActiveRecognition();
+    recognition.lang = import.meta.env.VITE_SPEECH_LANGUAGE || 'es-ES';
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.maxAlternatives = 1;
+    recognition.onresult = (event) => {
+      const transcript = Array.from(event.results).filter((result) => result.isFinal).map((result) => result[0]?.transcript?.trim()).filter(Boolean).join(' ');
+      if (!transcript || transcript === speechTranscriptRef.current) return;
+      speechTranscriptRef.current = transcript;
+      setAiCommand(transcript);
+      setAiStatus('inactivo');
+      setAiMessage('Transcripción lista para revisar y enviar.');
+    };
+    recognition.onerror = (event) => {
+      const messages = { 'not-allowed': 'Permiso de micrófono denegado.', 'service-not-allowed': 'El navegador no permite el servicio de voz.', 'no-speech': 'No se detectó voz. Inténtalo otra vez.', network: 'Error de red en el reconocimiento de voz.', aborted: 'Reconocimiento de voz detenido.' };
+      setAiStatus('error'); setAiMessage(messages[event.error] || 'No se pudo reconocer la voz. Puedes escribir la instrucción.');
+    };
+    recognition.onend = () => { if (speechRecognitionRef.current === recognition) speechRecognitionRef.current = null; setAiStatus((current) => current === 'escuchando' ? 'inactivo' : current); };
+    speechRecognitionRef.current = recognition;
+    setAiStatus('escuchando');
+    setAiMessage('Escuchando… habla y revisa la transcripción antes de enviarla.');
+    recognition.start();
+  };
+  useEffect(() => () => { aiRequestRef.current += 1; aiAbortRef.current?.abort(); speechRecognitionRef.current?.abort(); speechRecognitionRef.current = null; }, [activeDiagramId]);
   useEffect(() => {
     scheduleCurrentSaveRef.current = scheduleCurrentSave;
   });
@@ -372,6 +514,7 @@ export default function DiagramCanvas({ onLogout }) {
       hasPendingChangesRef.current = false;
       activeProjectRef.current = project.id;
       activeDiagramRef.current = diagram?.id || null;
+      diagramRevisionRef.current = diagram?.revision ?? diagram?.version ?? null;
       diagramLoadedRef.current = true;
       setActiveProjectId(project.id);
       setActiveDiagramId(diagram?.id || null);
@@ -786,6 +929,9 @@ export default function DiagramCanvas({ onLogout }) {
     saved: { label: socketStatus === 'connected' ? 'Guardado · Sync Live' : 'Guardado · Sin conexión en vivo', color: socketStatus === 'connected' ? 'text-emerald-300' : 'text-slate-300' },
     error: { label: 'Error al guardar', color: 'text-rose-300' },
   }[saveStatus];
+  // El panel mantiene una firma uniforme para ediciones de atributos; el
+  // segundo argumento no se usa al crear un atributo nuevo.
+  const index = undefined;
 
   return <div className="flex h-screen min-w-[1024px] flex-col overflow-hidden bg-[#070c1a] text-slate-200">
     <header className="flex h-[70px] shrink-0 items-center gap-2 overflow-hidden border-b border-[#1d2a4a] bg-[#091124] px-3">
@@ -798,7 +944,7 @@ export default function DiagramCanvas({ onLogout }) {
       <button onClick={() => setPeopleOpen(true)} title={visibleOnlineMembers.map((member) => member.usuario?.username || member.username || member.email || 'Usuario').join(', ') || 'Sin colaboradores conectados'} className="hidden shrink-0 items-center gap-2 rounded-lg border border-slate-600 bg-[#131d36] px-3 py-2 text-xs font-bold hover:bg-slate-700 lg:flex"><span className="flex -space-x-1">{visibleOnlineMembers.map((member, index) => { const user = member.usuario || member; const name = user.username || user.email || 'U'; const colors = ['bg-indigo-600', 'bg-emerald-600', 'bg-sky-500']; return <i key={user.id || name} className={`grid h-6 w-6 place-items-center rounded-full border-2 border-[#091124] ${colors[index]} text-[8px] not-italic`}>{name.slice(0, 2).toUpperCase()}</i>; })}{visibleOnlineMembers.length === 0 && <i className="grid h-6 w-6 place-items-center rounded-full border-2 border-[#091124] bg-slate-600 text-[8px] not-italic">—</i>}</span><span className="text-[9px] text-emerald-300">{onlineMembers.length}<br /><span className="text-slate-400">en línea</span></span></button>
       <div className="ml-1 flex shrink-0 gap-1"><button onClick={() => setShareOpen(true)} className="flex items-center gap-1 rounded-lg bg-gradient-to-r from-indigo-600 to-violet-600 px-3 py-2.5 text-[11px] font-bold text-white hover:from-indigo-500 hover:to-violet-500"><FiShare2 /> Compartir / Invitar</button><button onClick={generateSpringBoot} disabled={generating || isReadOnly || !activeDiagramId} className="flex items-center gap-1 rounded-lg bg-indigo-500 px-3 py-2.5 text-[11px] font-bold text-white hover:bg-indigo-400 disabled:cursor-wait disabled:opacity-55"><FiZap className="text-yellow-200" /> {generating ? 'Generando…' : 'Generar 4 Capas'}</button><button onClick={onLogout} title="Cerrar sesión" className="rounded-lg bg-rose-600 p-2.5 text-white hover:bg-rose-500"><FiLogOut /></button></div>
     </header>
-    <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar readOnly={isReadOnly} canUseRelations={canUseRelations} onlineMembers={onlineMembers} nodes={nodes} edges={edges} generating={generating} onCreate={(kind) => canEdit && createNode(kind)} onRelation={(type) => canUseRelations && setRelationType(type)} onCommand={() => {}} onListen={() => {}} onGenerate={generateSpringBoot} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow onInit={(instance) => { reactFlowRef.current = instance; }} nodes={canvasNodes} edges={canvasEdges} nodesDraggable={canEdit} nodesConnectable={canUseRelations} connectionMode={ConnectionMode.Loose} elementsSelectable={canEdit} onNodesChange={canEdit ? onNodesChange : undefined} onEdgesChange={canEdit ? onEdgesChange : undefined} onConnect={canUseRelations ? onConnect : undefined} onReconnect={canUseRelations ? reconnectRelation : undefined} onNodeClick={(event, node) => { setNodeMenu(null); setRelationMenu(null); selectNode(node.id); setEditorPosition({ x: event.clientX, y: event.clientY }); }} onPaneClick={() => { selectNode(null); setNodeMenu(null); setRelationMenu(null); }} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow>{canUseRelations && <PropertiesPanel node={selectedNode} position={editorPosition} onClose={() => { selectNode(null); setEditorPosition(null); }} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onAddMethod={() => addMethod(selectedNode.id)} onUpdateMethod={(index, value) => updateMethod(selectedNode.id, index, value)} onRemoveMethod={(index) => removeMethod(selectedNode.id, index)} onDelete={() => requestDeleteNode(selectedNode.id)} />}<div className={`absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] ${syncIndicator.color}`}>● {isReadOnly ? 'Modo solo lectura' : syncIndicator.label}</div></main></div>
+    <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar readOnly={isReadOnly} canUseRelations={canUseRelations} onlineMembers={onlineMembers} nodes={nodes} edges={edges} generating={generating} command={aiCommand} onCommandChange={setAiCommand} aiStatus={aiStatus} aiMessage={aiMessage} aiPlan={aiPlan} listening={aiStatus === 'escuchando'} onCreate={(kind) => canEdit && createNode(kind)} onRelation={(type) => canUseRelations && setRelationType(type)} onCommand={interpretAiCommand} onListen={toggleVoiceRecognition} onConfirmAi={() => applyCurrentAiPlan(aiPlan, true)} onCancelAi={cancelAi} onGenerate={generateSpringBoot} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow onInit={(instance) => { reactFlowRef.current = instance; }} nodes={canvasNodes} edges={canvasEdges} nodesDraggable={canEdit} nodesConnectable={canUseRelations} connectionMode={ConnectionMode.Loose} elementsSelectable={canEdit} onNodesChange={canEdit ? onNodesChange : undefined} onEdgesChange={canEdit ? onEdgesChange : undefined} onConnect={canUseRelations ? onConnect : undefined} onReconnect={canUseRelations ? reconnectRelation : undefined} onNodeClick={(event, node) => { setNodeMenu(null); setRelationMenu(null); selectNode(node.id); setEditorPosition({ x: event.clientX, y: event.clientY }); }} onPaneClick={() => { selectNode(null); setNodeMenu(null); setRelationMenu(null); }} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow>{canUseRelations && <PropertiesPanel node={selectedNode} position={editorPosition} onClose={() => { selectNode(null); setEditorPosition(null); }} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id, index)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onAddMethod={() => addMethod(selectedNode.id)} onUpdateMethod={(index, value) => updateMethod(selectedNode.id, index, value)} onRemoveMethod={(index) => removeMethod(selectedNode.id, index)} onDelete={() => requestDeleteNode(selectedNode.id)} />}<div className={`absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] ${syncIndicator.color}`}>● {isReadOnly ? 'Modo solo lectura' : syncIndicator.label}</div></main></div>
     {toast && <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded bg-[#18264a] px-4 py-3">{toast}</div>}
     {generationErrors.length > 0 && <GenerationErrorDialog errors={generationErrors} onClose={() => { setGenerationErrors([]); setHighlightedEdgeId(null); }} onFocus={focusGenerationIssue} />}
     {pendingXmiFile && <XmiImportConfirmation file={pendingXmiFile} busy={xmiBusy} onClose={() => !xmiBusy && setPendingXmiFile(null)} onConfirm={confirmXmiImport} />}

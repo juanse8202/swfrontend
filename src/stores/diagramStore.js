@@ -360,7 +360,7 @@ const useDiagramStore = create((set, get) => ({
     });
     return true;
   },
-  restore: (diagram = {}, { preserveSelection = false } = {}) => {
+  restore: (diagram = {}, { preserveSelection = false, recordHistory = false } = {}) => {
     let migrated = false;
     set((current) => {
       const nodes = (diagram.nodes || []).map((node) => {
@@ -391,7 +391,16 @@ const useDiagramStore = create((set, get) => ({
       const selectedNodeId = preserveSelection && nodes.some((node) => node.id === current.selectedNodeId)
         ? current.selectedNodeId
         : null;
-      return { nodes, edges, selectedNodeId, history: [], future: [] };
+      return {
+        nodes,
+        edges,
+        selectedNodeId,
+        // Una aplicación IA es una única operación autoritativa: conserva un
+        // único punto de deshacer sin convertir restauraciones remotas en
+        // cambios locales del historial.
+        history: recordHistory ? [...current.history, snapshot(current)].slice(-50) : [],
+        future: [],
+      };
     });
     return migrated;
   },
