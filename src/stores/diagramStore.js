@@ -107,16 +107,26 @@ const appearanceFor = (kind) => {
   const [headerBg, headerText, methodColor] = colors[kind] || colors.entity;
   return { kind, stereotype: stereotypes[kind] || '@Entity', icon: kind === 'enum' ? 'format_list_bulleted' : kind === 'dto' ? 'description' : kind === 'interface' ? 'settings_ethernet' : 'account_tree', headerBg, headerText, methodColor };
 };
+const defaultEnumLiteral = 'NUEVO_VALOR';
+const normalizeEnumLiterals = (literals) => {
+  const normalized = (Array.isArray(literals) ? literals : []).map((literal) => String(literal || '').trim()).filter(Boolean);
+  return normalized.length ? normalized : [defaultEnumLiteral];
+};
+const normalizeAttribute = (attribute, kind) => {
+  const normalized = { ...attribute, name: String(attribute?.name || '').trim(), type: String(attribute?.type || '').replace(/\.java$/i, '').trim() };
+  if (kind !== 'entity' || !normalized.embedded) return { ...normalized, embedded: false };
+  return { ...normalized, embedded: true };
+};
 const dataForKind = (kind, data) => {
   if (!kind) return {};
   if (kind === 'interface') return { ...appearanceFor(kind), abstract: true, properties: [] };
-  if (kind === 'enum') return { ...appearanceFor(kind), abstract: false, properties: [], methods: [], literals: data.literals || [] };
+  if (kind === 'enum') return { ...appearanceFor(kind), abstract: false, properties: [], methods: [], literals: normalizeEnumLiterals(data.literals) };
   if (kind === 'dto' || kind === 'embeddable') return { ...appearanceFor(kind), abstract: false, methods: [] };
-  if (kind === 'entity') return { ...appearanceFor(kind), persistent: data.persistent ?? true };
+  if (kind === 'entity') return { ...appearanceFor(kind), abstract: Boolean(data.abstract), persistent: data.persistent ?? true };
   return { ...appearanceFor(kind), abstract: Boolean(data.abstract) };
 };
 const makeNode = (kind = 'entity', title = 'NuevaEntidad', position = { x: 180, y: 160 }) => {
-  return { id: `${kind}-${crypto.randomUUID?.() || Date.now()}`, type: 'umlClass', position, data: { ...appearanceFor(kind), title: title.endsWith('.java') ? title : `${title}.java`, abstract: kind === 'interface', persistent: kind === 'entity', literals: kind === 'enum' ? [] : undefined, properties: kind === 'entity' ? [{ visibility: '#', name: 'id', type: 'UUID (@Id)', id: true }] : [], methods: [] } };
+  return { id: `${kind}-${crypto.randomUUID?.() || Date.now()}`, type: 'umlClass', position, data: { ...appearanceFor(kind), title: title.endsWith('.java') ? title : `${title}.java`, abstract: kind === 'interface', persistent: kind === 'entity', literals: kind === 'enum' ? [defaultEnumLiteral] : undefined, properties: kind === 'entity' ? [{ visibility: '#', name: 'id', type: 'UUID (@Id)', id: true, embedded: false }] : [], methods: [] } };
 };
 const associationClassNodeFor = (state, edge) => {
   const source = state.nodes.find((node) => node.id === edge.source);
@@ -214,9 +224,9 @@ const useDiagramStore = create((set, get) => ({
   },
   selectNode: (id) => set({ selectedNodeId: id }),
   createNode: (kind, title, position) => { const node = makeNode(kind, title || 'NuevaEntidad', position || { x: 160 + Math.random() * 400, y: 120 + Math.random() * 280 }); set((state) => ({ ...historyPatch(state), nodes: [...state.nodes, node], selectedNodeId: null })); return node; },
-  updateNode: (id, patch) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, ...patch, ...dataForKind(patch.kind, { ...node.data, ...patch }) } } : node) })),
-  addAttribute: (id) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, properties: [...node.data.properties, { visibility: '+', name: 'nuevoAtributo', type: 'String' }] } } : node) })),
-  updateAttribute: (id, index, patch) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, properties: node.data.properties.map((p, i) => i === index ? { ...p, ...patch } : p) } } : node) })),
+  updateNode: (id, patch) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => { if (node.id !== id) return node; const nextData = { ...node.data, ...patch }; const kind = nextData.kind || 'entity'; return { ...node, data: { ...nextData, ...dataForKind(kind, nextData), kind } }; }) })),
+  addAttribute: (id) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, properties: [...node.data.properties, { visibility: '+', name: 'nuevoAtributo', type: 'String', embedded: false }] } } : node) })),
+  updateAttribute: (id, index, patch) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, properties: node.data.properties.map((property, itemIndex) => itemIndex === index ? normalizeAttribute({ ...property, ...patch }, node.data.kind || 'entity') : property) } } : node) })),
   removeAttribute: (id, index) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, properties: node.data.properties.filter((_, i) => i !== index) } } : node) })),
   addMethod: (id) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, methods: [...(node.data.methods || []), 'nuevoMetodo(): void'] } } : node) })),
   updateMethod: (id, index, value) => set((state) => ({ ...historyPatch(state), nodes: state.nodes.map((node) => node.id === id ? { ...node, data: { ...node.data, methods: (node.data.methods || []).map((method, i) => i === index ? value : method) } } : node) })),
@@ -340,8 +350,9 @@ const useDiagramStore = create((set, get) => ({
     set((current) => {
       const nodes = (diagram.nodes || []).map((node) => {
         const kind = node.data?.kind || 'entity';
-        const data = { ...node.data, ...appearanceFor(kind), kind, abstract: node.data?.abstract ?? kind === 'interface', properties: node.data?.properties || [], methods: node.data?.methods || [] };
-        if (kind === 'enum') data.literals = node.data?.literals || [];
+        const baseData = { ...node.data, kind, properties: (node.data?.properties || []).map((attribute) => normalizeAttribute(attribute, kind)), methods: node.data?.methods || [] };
+        const data = { ...baseData, ...dataForKind(kind, baseData), kind };
+        migrated ||= node.data?.kind !== kind || node.data?.abstract !== data.abstract || (kind === 'enum' && JSON.stringify(node.data?.literals) !== JSON.stringify(data.literals));
         return { ...node, data };
       });
       const normalizedEdges = (diagram.edges || []).map((edge) => {
