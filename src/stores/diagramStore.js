@@ -11,9 +11,9 @@ const legacyRelationTypes = { oneToMany: 'asociacion', manyToOne: 'asociacion', 
 const legacyJpaAnnotations = { oneToMany: '@OneToMany', manyToOne: '@ManyToOne', manyToMany: '@ManyToMany', oneToOne: '@OneToOne' };
 const targetWholeConvention = 'target-whole-v1';
 const relationMeta = {
-  asociacion: { cardinality: '1 : N', jpaAnnotation: '@OneToMany' },
-  agregacion: { cardinality: '1 : N', jpaAnnotation: '' },
-  composicion: { cardinality: '1 : N', jpaAnnotation: '' },
+  asociacion: { cardinality: '1 : *', jpaAnnotation: '@OneToMany' },
+  agregacion: { cardinality: '1 : *', jpaAnnotation: '' },
+  composicion: { cardinality: '1 : *', jpaAnnotation: '' },
   herencia: { cardinality: '1 : 1', jpaAnnotation: '' },
   realizacion: { cardinality: '1 : 1', jpaAnnotation: '' },
   dependencia: { cardinality: '1 : 1', jpaAnnotation: '' },
@@ -72,6 +72,8 @@ const normalizeRelationEdge = (edge) => {
   const data = edge?.data || {};
   const relationType = legacyRelationTypes[data.relationType] || data.relationType || 'asociacion';
   const meta = relationMeta[relationType] || relationMeta.asociacion;
+  const [defaultSourceMultiplicity, defaultTargetMultiplicity] = meta.cardinality.split(':').map((value) => value.trim());
+  const normalizeMultiplicity = (value, fallback) => value === 'N' ? '*' : value || fallback;
   const needsTargetWholeMigration = (relationType === 'agregacion' || relationType === 'composicion') && data.relationConvention !== targetWholeConvention;
   return {
     ...edge,
@@ -83,11 +85,18 @@ const normalizeRelationEdge = (edge) => {
       ...data,
       relationType,
       ...(needsTargetWholeMigration ? {
-        multiplicidadOrigen: data.multiplicidadDestino,
-        multiplicidadDestino: data.multiplicidadOrigen,
+        multiplicidadOrigen: normalizeMultiplicity(data.multiplicidadDestino, defaultSourceMultiplicity),
+        multiplicidadDestino: normalizeMultiplicity(data.multiplicidadOrigen, defaultTargetMultiplicity),
         relationConvention: targetWholeConvention,
-      } : {}),
+      } : { multiplicidadOrigen: normalizeMultiplicity(data.multiplicidadOrigen, defaultSourceMultiplicity), multiplicidadDestino: normalizeMultiplicity(data.multiplicidadDestino, defaultTargetMultiplicity) }),
       jpaAnnotation: data.jpaAnnotation ?? data.label ?? legacyJpaAnnotations[data.relationType] ?? meta.jpaAnnotation,
+      ...( ['asociacion', 'agregacion', 'composicion'].includes(relationType) ? {
+        ownerNodeId: data.ownerNodeId || ((data.wholeNodeId || (data.relationConvention === targetWholeConvention ? edge.target : null)) || edge.source),
+        bidirectional: Boolean(data.bidirectional),
+        sourceRole: data.sourceRole || '',
+        targetRole: data.targetRole || '',
+        ...(relationType === 'agregacion' || relationType === 'composicion' ? { wholeNodeId: data.wholeNodeId || (data.relationConvention === targetWholeConvention ? edge.target : undefined) } : {}),
+      } : {}),
     },
   };
 };
@@ -313,7 +322,8 @@ const useDiagramStore = create((set, get) => ({
     set((state) => ({ ...historyPatch(state), edges: state.edges.map((edge) => edge.id === id ? { ...edge, data: { ...edge.data, multiplicidadOrigen, multiplicidadDestino, cardinality: `${multiplicidadOrigen} : ${multiplicidadDestino}` } } : edge) }));
     diagramMutationListener?.();
   },
-  updateRelation: (id, { multiplicidadOrigen, multiplicidadDestino, umlLabel }) => {
+  updateRelation: (id, patch) => {
+    const { multiplicidadOrigen, multiplicidadDestino, umlLabel, ...semanticPatch } = patch;
     set((state) => ({ ...historyPatch(state), edges: state.edges.map((edge) => edge.id === id ? {
       ...edge,
       data: {
@@ -322,6 +332,7 @@ const useDiagramStore = create((set, get) => ({
         multiplicidadDestino,
         umlLabel: umlLabel?.trim() || '',
         cardinality: `${multiplicidadOrigen} : ${multiplicidadDestino}`,
+        ...semanticPatch,
       },
     } : edge) }));
     diagramMutationListener?.();
@@ -335,7 +346,7 @@ const useDiagramStore = create((set, get) => ({
     const [multiplicidadOrigen, multiplicidadDestino] = meta.cardinality.split(':').map((value) => value.trim());
     const relationConvention = relationType === 'agregacion' || relationType === 'composicion' ? targetWholeConvention : undefined;
     set((state) => {
-      const edge = { id: relationId(), source, target, ...closestHandlesFor(state.nodes, source, target), type: 'relationEdge', data: { relationType, relationConvention, label: meta.jpaAnnotation, jpaAnnotation: meta.jpaAnnotation, umlLabel: '', cardinality: meta.cardinality, multiplicidadOrigen, multiplicidadDestino } };
+      const edge = { id: relationId(), source, target, ...closestHandlesFor(state.nodes, source, target), type: 'relationEdge', data: { relationType, relationConvention, label: meta.jpaAnnotation, jpaAnnotation: meta.jpaAnnotation, umlLabel: '', cardinality: meta.cardinality, multiplicidadOrigen, multiplicidadDestino, ownerNodeId: relationType === 'agregacion' || relationType === 'composicion' ? target : source, wholeNodeId: relationType === 'agregacion' || relationType === 'composicion' ? target : undefined, bidirectional: false, sourceRole: '', targetRole: '' } };
       const pendingEdges = [...state.edges, edge];
       const layout = distributeRelationAnchors(state.nodes, pendingEdges);
       return { ...historyPatch(state), edges: pendingEdges.map((item) => {
