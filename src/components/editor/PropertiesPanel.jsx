@@ -1,4 +1,4 @@
-import { useEffect } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { FiPlus, FiTrash2, FiX } from 'react-icons/fi';
 import { useEscapeClose } from '../../hooks/useEscapeClose';
 import useDiagramStore from '../../stores/diagramStore';
@@ -8,6 +8,11 @@ const typeLabels = { entity: 'Entidad', class: 'Clase Java', interface: 'Interfa
 export default function PropertiesPanel({ node, position, onClose, onUpdate, onAddAttribute, onUpdateAttribute, onRemoveAttribute, onAddMethod, onUpdateMethod, onRemoveMethod, onDelete }) {
   useEscapeClose(Boolean(node), onClose);
   const nodes = useDiagramStore((state) => state.nodes);
+  const [panelPosition, setPanelPosition] = useState(() => position ? {
+    x: Math.min(Math.max(12, position.x), window.innerWidth - 340),
+    y: Math.min(Math.max(12, position.y), window.innerHeight - 520),
+  } : null);
+  const dragRef = useRef(null);
   useEffect(() => {
     if (!node) return undefined;
     const closeOnEnter = (event) => {
@@ -25,12 +30,34 @@ export default function PropertiesPanel({ node, position, onClose, onUpdate, onA
   const hasMethods = ['entity', 'class', 'interface'].includes(kind);
   const title = String(node.data.title || '').replace(/\.java$/, '');
   const embeddables = nodes.filter((item) => item.id !== node.id && item.data?.kind === 'embeddable');
-  const style = position ? { left: Math.min(Math.max(12, position.x), window.innerWidth - 340), top: Math.min(Math.max(12, position.y), window.innerHeight - 520) } : undefined;
+  const style = panelPosition
+    ? { left: panelPosition.x, top: panelPosition.y }
+    : position ? { left: Math.min(Math.max(12, position.x), window.innerWidth - 340), top: Math.min(Math.max(12, position.y), window.innerHeight - 520) } : undefined;
   const properties = node.data.properties || [];
   const literals = node.data.literals || [];
   const setLiteral = (index, value) => onUpdate({ literals: literals.map((literal, itemIndex) => itemIndex === index ? value : literal) });
+  const startDrag = (event) => {
+    event.preventDefault();
+    const current = panelPosition || { x: 16, y: 16 };
+    dragRef.current = { x: event.clientX - current.x, y: event.clientY - current.y };
+    const onMove = (moveEvent) => {
+      const drag = dragRef.current;
+      if (!drag) return;
+      setPanelPosition({
+        x: Math.max(12, Math.min(moveEvent.clientX - drag.x, window.innerWidth - 340)),
+        y: Math.max(12, Math.min(moveEvent.clientY - drag.y, window.innerHeight - 520)),
+      });
+    };
+    const onUp = () => {
+      dragRef.current = null;
+      window.removeEventListener('mousemove', onMove);
+      window.removeEventListener('mouseup', onUp);
+    };
+    window.addEventListener('mousemove', onMove);
+    window.addEventListener('mouseup', onUp);
+  };
   return <aside style={style} aria-label="Editar nodo UML" className={`fixed z-30 w-80 rounded-xl border border-slate-700 bg-[#101a31] p-4 text-xs text-slate-200 shadow-2xl ${position ? '' : 'right-4 top-4'}`}>
-    <div className="mb-4 flex items-center justify-between"><b className="text-sm">Editar {typeLabels[kind] || 'nodo'}</b><button onClick={onClose} className="rounded p-1 hover:bg-slate-700"><FiX /></button></div>
+    <div onMouseDown={startDrag} className="mb-4 flex cursor-move items-center justify-between rounded px-1 py-1 hover:bg-slate-700/50"><div><b className="text-sm">Editar {typeLabels[kind] || 'nodo'}</b><small className="ml-2 text-[9px] text-slate-500">Arrastra para mover</small></div><button onMouseDown={(event) => event.stopPropagation()} onClick={onClose} className="rounded p-1 hover:bg-slate-700"><FiX /></button></div>
     <label className="mb-1 block text-slate-400">Nombre</label><input value={title} onChange={(event) => onUpdate({ title: `${event.target.value}.java` })} title="Presiona Enter para cerrar" className="mb-3 w-full rounded border border-slate-600 bg-[#080f20] px-3 py-2 outline-none focus:border-indigo-400" />
     <label className="mb-3 block text-slate-400">Tipo<select value={kind} onChange={(event) => onUpdate({ kind: event.target.value })} className="mt-1 w-full rounded border border-slate-600 bg-[#080f20] px-3 py-2"><option value="entity">@Entity</option><option value="class">Clase Java</option><option value="interface">&lt;&lt;interface&gt;&gt;</option><option value="dto">DTO / Record</option><option value="enum">enum</option><option value="embeddable">@Embeddable</option></select></label>
     {kind === 'class' && <label className="mb-4 flex items-center gap-2 text-slate-300"><input type="checkbox" checked={Boolean(node.data.abstract)} onChange={(event) => onUpdate({ abstract: event.target.checked })} />Clase abstracta</label>}

@@ -68,10 +68,12 @@ const distributeRelationAnchors = (nodes, edges) => {
   });
   return layout;
 };
-const normalizeRelationEdge = (edge) => {
+const normalizeRelationEdge = (edge, nodeKinds = new Map()) => {
   const data = edge?.data || {};
   const relationType = legacyRelationTypes[data.relationType] || data.relationType || 'asociacion';
   const meta = relationMeta[relationType] || relationMeta.asociacion;
+  const endpointsAreEntities = nodeKinds.get(edge.source) === 'entity' && nodeKinds.get(edge.target) === 'entity';
+  const jpaManaged = typeof data.jpaManaged === 'boolean' ? data.jpaManaged : endpointsAreEntities;
   const [defaultSourceMultiplicity, defaultTargetMultiplicity] = meta.cardinality.split(':').map((value) => value.trim());
   const normalizeMultiplicity = (value, fallback) => {
     if (value === 'N') return '*';
@@ -95,6 +97,7 @@ const normalizeRelationEdge = (edge) => {
       } : { multiplicidadOrigen: normalizeMultiplicity(data.multiplicidadOrigen, defaultSourceMultiplicity), multiplicidadDestino: normalizeMultiplicity(data.multiplicidadDestino, defaultTargetMultiplicity) }),
       jpaAnnotation: data.jpaAnnotation ?? data.label ?? legacyJpaAnnotations[data.relationType] ?? meta.jpaAnnotation,
       ...( ['asociacion', 'agregacion', 'composicion'].includes(relationType) ? {
+        jpaManaged,
         ownerNodeId: data.ownerNodeId || ((data.wholeNodeId || (data.relationConvention === targetWholeConvention ? edge.target : null)) || edge.source),
         bidirectional: Boolean(data.bidirectional),
         sourceRole: data.sourceRole || '',
@@ -113,7 +116,7 @@ const canConnectRelation = (relationType, sourceNode, targetNode) => {
   if (!sourceNode || !targetNode || sourceNode.id === targetNode.id) return false;
   if (relationType === 'realizacion') return isClassNode(sourceNode) && targetNode.data?.kind === 'interface';
   if (relationType === 'herencia') return isClassNode(sourceNode) && isClassNode(targetNode);
-  if (['asociacion', 'agregacion', 'composicion'].includes(relationType)) return sourceNode.data?.kind === 'entity' && targetNode.data?.kind === 'entity';
+  if (['asociacion', 'agregacion', 'composicion'].includes(relationType)) return isClassNode(sourceNode) && isClassNode(targetNode);
   return true;
 };
 const appearanceFor = (kind) => {
@@ -140,6 +143,18 @@ const dataForKind = (kind, data) => {
 };
 const makeNode = (kind = 'entity', title = 'NuevaEntidad', position = { x: 180, y: 160 }) => {
   return { id: `${kind}-${crypto.randomUUID?.() || Date.now()}`, type: 'umlClass', position, data: { ...appearanceFor(kind), title: title.endsWith('.java') ? title : `${title}.java`, abstract: kind === 'interface', persistent: kind === 'entity', literals: kind === 'enum' ? [defaultEnumLiteral] : undefined, properties: kind === 'entity' ? [{ visibility: '#', name: 'id', type: 'UUID (@Id)', id: true, embedded: false }] : [], methods: [] } };
+};
+const isManyMultiplicity = (value) => ['*', 'N', '0..*', '1..*'].includes(String(value || '').trim());
+const isManyToManyAssociation = (edge, data = edge?.data || {}) => (
+  data.relationType === 'asociacion'
+  && isManyMultiplicity(data.multiplicidadOrigen)
+  && isManyMultiplicity(data.multiplicidadDestino)
+);
+const withoutInvalidAssociationClass = (edge, data) => {
+  if (!data.associationClassNodeId || isManyToManyAssociation(edge, data)) return data;
+  const next = { ...data };
+  delete next.associationClassNodeId;
+  return next;
 };
 const associationClassNodeFor = (state, edge) => {
   const source = state.nodes.find((node) => node.id === edge.source);
@@ -171,17 +186,33 @@ export const createStarterDiagram = () => {
 };
 
 const useDiagramStore = create((set, get) => ({
-  nodes: [], edges: [], selectedNodeId: null, history: [], future: [],
+  nodes: [], edges: [], selectedNodeId: null, activeRelationEditorId: null, history: [], future: [],
+  openRelationEditor: (id) => set({ activeRelationEditorId: id }),
+  closeRelationEditor: () => set({ activeRelationEditorId: null }),
   onNodesChange: (changes) => set((state) => {
     // React Flow emite cambios internos de dimensiones/selección al montar un
     // nodo. No deben ocupar una entrada de undo antes de la acción real.
+    const movedNodeIds = new Set(changes
+      .filter((change) => change.type === 'position' && change.dragging === false && change.position)
+      .map((change) => change.id));
     const isUserHistoryChange = changes.some((change) => change.type === 'remove'
       || (change.type === 'position' && change.dragging === false));
-    return { ...(isUserHistoryChange ? historyPatch(state) : {}), nodes: applyNodeChanges(changes, state.nodes) };
+    const edges = movedNodeIds.size === 0 ? state.edges : state.edges.map((edge) => {
+      if (!movedNodeIds.has(edge.source) && !movedNodeIds.has(edge.target)) return edge;
+      if (!edge.data?.xmiWaypoints && !edge.data?.xmiLabelPositions) return edge;
+      const data = { ...edge.data };
+      delete data.xmiWaypoints;
+      delete data.xmiLabelPositions;
+      return { ...edge, data };
+    });
+    return { ...(isUserHistoryChange ? historyPatch(state) : {}), nodes: applyNodeChanges(changes, state.nodes), edges };
   }),
   onEdgesChange: (changes) => set((state) => ({ ...historyPatch(state), edges: applyEdgeChanges(changes, state.edges) })),
   onConnect: (connection) => set((state) => {
-    const newEdge = { ...connection, ...closestHandlesFor(state.nodes, connection.source, connection.target), id: relationId(), type: 'relationEdge', data: { relationType: 'asociacion', label: '@OneToMany', jpaAnnotation: '@OneToMany', umlLabel: '', cardinality: '1 : N', multiplicidadOrigen: '1', multiplicidadDestino: 'N' } };
+    const sourceNode = state.nodes.find((node) => node.id === connection.source);
+    const targetNode = state.nodes.find((node) => node.id === connection.target);
+    const jpaManaged = sourceNode?.data?.kind === 'entity' && targetNode?.data?.kind === 'entity';
+    const newEdge = { ...connection, ...closestHandlesFor(state.nodes, connection.source, connection.target), id: relationId(), type: 'relationEdge', data: { relationType: 'asociacion', label: '@OneToMany', jpaAnnotation: '@OneToMany', jpaManaged, umlLabel: '', cardinality: '', multiplicidadOrigen: '', multiplicidadDestino: '' } };
     const pendingEdges = addEdge(newEdge, state.edges);
     const layout = distributeRelationAnchors(state.nodes, pendingEdges);
     return { ...historyPatch(state), edges: pendingEdges.map((edge) => {
@@ -276,7 +307,7 @@ const useDiagramStore = create((set, get) => ({
     set((state) => {
       const edge = state.edges.find((item) => item.id === edgeId);
       const associationNode = state.nodes.find((node) => node.id === nodeId);
-      if (!edge || edge.data?.relationType !== 'asociacion' || !associationNode || nodeId === edge.source || nodeId === edge.target) return {};
+      if (!edge || !isManyToManyAssociation(edge) || !associationNode || nodeId === edge.source || nodeId === edge.target) return {};
       updated = true;
       return {
         ...historyPatch(state),
@@ -290,7 +321,7 @@ const useDiagramStore = create((set, get) => ({
     let associationClassNode = null;
     set((state) => {
       const edge = state.edges.find((item) => item.id === edgeId);
-      if (!edge || edge.data?.relationType !== 'asociacion' || edge.data.associationClassNodeId) return {};
+      if (!edge || !isManyToManyAssociation(edge) || edge.data.associationClassNodeId) return {};
       associationClassNode = associationClassNodeFor(state, edge);
       if (!associationClassNode) return {};
       return {
@@ -323,22 +354,27 @@ const useDiagramStore = create((set, get) => ({
   undo: () => set((state) => { const previous = state.history.at(-1); return previous ? { nodes: previous.nodes, edges: previous.edges, selectedNodeId: null, history: state.history.slice(0, -1), future: [snapshot(state), ...state.future].slice(0, 50) } : {}; }),
   redo: () => set((state) => { const next = state.future[0]; return next ? { nodes: next.nodes, edges: next.edges, selectedNodeId: null, history: [...state.history, snapshot(state)].slice(-50), future: state.future.slice(1) } : {}; }),
   updateRelationMultiplicity: (id, multiplicidadOrigen, multiplicidadDestino) => {
-    set((state) => ({ ...historyPatch(state), edges: state.edges.map((edge) => edge.id === id ? { ...edge, data: { ...edge.data, multiplicidadOrigen, multiplicidadDestino, cardinality: `${multiplicidadOrigen} : ${multiplicidadDestino}` } } : edge) }));
+    set((state) => ({ ...historyPatch(state), edges: state.edges.map((edge) => {
+      if (edge.id !== id) return edge;
+      const data = withoutInvalidAssociationClass(edge, { ...edge.data, multiplicidadOrigen, multiplicidadDestino, cardinality: `${multiplicidadOrigen} : ${multiplicidadDestino}` });
+      return { ...edge, data };
+    }) }));
     diagramMutationListener?.();
   },
   updateRelation: (id, patch) => {
     const { multiplicidadOrigen, multiplicidadDestino, umlLabel, ...semanticPatch } = patch;
-    set((state) => ({ ...historyPatch(state), edges: state.edges.map((edge) => edge.id === id ? {
-      ...edge,
-      data: {
+    set((state) => ({ ...historyPatch(state), edges: state.edges.map((edge) => {
+      if (edge.id !== id) return edge;
+      const data = withoutInvalidAssociationClass(edge, {
         ...edge.data,
         multiplicidadOrigen,
         multiplicidadDestino,
         umlLabel: umlLabel?.trim() || '',
         cardinality: `${multiplicidadOrigen} : ${multiplicidadDestino}`,
         ...semanticPatch,
-      },
-    } : edge) }));
+      });
+      return { ...edge, data };
+    }) }));
     diagramMutationListener?.();
   },
   createRelation: (type, source, target) => {
@@ -347,10 +383,14 @@ const useDiagramStore = create((set, get) => ({
     if (!source || !target || !canConnectRelation(legacyRelationTypes[type] || type, sourceNode, targetNode)) return false;
     const relationType = legacyRelationTypes[type] || type;
     const meta = relationMeta[relationType] || relationMeta.asociacion;
-    const [multiplicidadOrigen, multiplicidadDestino] = meta.cardinality.split(':').map((value) => value.trim());
+    // A cardinality is optional UML metadata. Do not invent one for a new
+    // relationship; the user can select it later in the relation editor.
+    const multiplicidadOrigen = '';
+    const multiplicidadDestino = '';
     const relationConvention = relationType === 'agregacion' || relationType === 'composicion' ? targetWholeConvention : undefined;
     set((state) => {
-      const edge = { id: relationId(), source, target, ...closestHandlesFor(state.nodes, source, target), type: 'relationEdge', data: { relationType, relationConvention, label: meta.jpaAnnotation, jpaAnnotation: meta.jpaAnnotation, umlLabel: '', cardinality: meta.cardinality, multiplicidadOrigen, multiplicidadDestino, ownerNodeId: relationType === 'agregacion' || relationType === 'composicion' ? target : source, wholeNodeId: relationType === 'agregacion' || relationType === 'composicion' ? target : undefined, bidirectional: false, sourceRole: '', targetRole: '' } };
+      const jpaManaged = sourceNode?.data?.kind === 'entity' && targetNode?.data?.kind === 'entity';
+      const edge = { id: relationId(), source, target, ...closestHandlesFor(state.nodes, source, target), type: 'relationEdge', data: { relationType, relationConvention, label: meta.jpaAnnotation, jpaAnnotation: meta.jpaAnnotation, jpaManaged, umlLabel: '', cardinality: '', multiplicidadOrigen, multiplicidadDestino, ownerNodeId: relationType === 'agregacion' || relationType === 'composicion' ? target : source, wholeNodeId: relationType === 'agregacion' || relationType === 'composicion' ? target : undefined, bidirectional: false, sourceRole: '', targetRole: '' } };
       const pendingEdges = [...state.edges, edge];
       const layout = distributeRelationAnchors(state.nodes, pendingEdges);
       return { ...historyPatch(state), edges: pendingEdges.map((item) => {
@@ -370,13 +410,31 @@ const useDiagramStore = create((set, get) => ({
         migrated ||= node.data?.kind !== kind || node.data?.abstract !== data.abstract || (kind === 'enum' && JSON.stringify(node.data?.literals) !== JSON.stringify(data.literals));
         return { ...node, data };
       });
+      const nodeKinds = new Map(nodes.map((node) => [node.id, node.data?.kind || 'entity']));
       const normalizedEdges = (diagram.edges || []).map((edge) => {
-        const normalized = normalizeRelationEdge(edge);
+        const normalized = normalizeRelationEdge(edge, nodeKinds);
         migrated ||= normalized.source !== edge.source || normalized.target !== edge.target || normalized.sourceHandle !== edge.sourceHandle || normalized.targetHandle !== edge.targetHandle || normalized.data.relationConvention !== edge.data?.relationConvention;
         return normalized;
       });
+      // An EA import has no React Flow handle IDs.  Resolve its connector
+      // ends from the imported node geometry before the first paint, while
+      // never replacing anchors a DiagramCraft user already positioned.
+      const importedWithoutAnchors = normalizedEdges.filter((edge) => edge.data?.xmiImported
+        && (!edge.data?.sourceAnchor || !edge.data?.targetAnchor));
+      const importedLayout = distributeRelationAnchors(nodes, importedWithoutAnchors);
+      const placedEdges = normalizedEdges.map((edge) => {
+        const placement = importedLayout[edge.id];
+        if (!placement) return edge;
+        migrated = true;
+        return {
+          ...edge,
+          sourceHandle: placement.sourceHandle,
+          targetHandle: placement.targetHandle,
+          data: { ...edge.data, sourceAnchor: placement.sourceAnchor, targetAnchor: placement.targetAnchor },
+        };
+      });
       const nodeIds = new Set(nodes.map((node) => node.id));
-      const edges = normalizedEdges.map((edge) => {
+      const edges = placedEdges.map((edge) => {
         const associationClassNodeId = edge.data?.associationClassNodeId;
         const isValidAssociationClass = edge.data?.relationType === 'asociacion'
           && nodeIds.has(associationClassNodeId)
