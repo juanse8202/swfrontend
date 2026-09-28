@@ -13,13 +13,17 @@ import PeopleDialog from './PeopleDialog';
 import CollaboratorsDialog from '../collaboration/CollaboratorsDialog';
 import { useEscapeClose } from '../../hooks/useEscapeClose';
 import useDiagramStore, { createStarterDiagram, setDiagramMutationListener } from '../../stores/diagramStore';
-import { actualizarRolMiembro, cancelarInvitacion, contenidoDiagrama, crearDiagramaPrincipal, crearProyecto, eliminarColaborador, exportarXmi, generarSpringBoot, guardarDiagrama, importarXmi, invitarProyecto, listarProyectos, obtenerDiagramaPrincipal, reenviarInvitacion } from '../../api/diagramApi';
+import { actualizarRolMiembro, cancelarInvitacion, contenidoDiagrama, crearDiagramaPrincipal, crearProyecto, eliminarColaborador, exportarXmi, generarSpringBoot, guardarDiagrama, importarXmi, invitarProyecto, listarProyectos, obtenerDiagrama, obtenerDiagramaPrincipal, reenviarInvitacion } from '../../api/diagramApi';
 import { obtenerSesion } from '../../api/authApi';
 import { applyAiPlan, interpretAi } from '../../api/aiApi';
 import { useDiagramSocket } from '../../hooks/useDiagramSocket';
+import { isStaleRevisionPayload, normalizeVoiceTranscript, planNeedsConfirmation, voiceFinalAction, voiceRecognitionError } from '../../utils/aiFlow';
+import { DEFAULT_VOICE_PREFERENCES, selectBestSpanishVoice, speechSegments } from '../../utils/dianaVoice';
+import { isOwnSocketEvent, saveSnapshotIsCurrent, shouldReplaceRemoteDocument } from '../../utils/collaborationSync';
 
 const nodeTypes = { umlClass: ClassNode };
 const edgeTypes = { relationEdge: RelationEdge };
+const createRequestId = () => crypto.randomUUID?.() || `ai-${Date.now()}-${Math.random().toString(36).slice(2)}`;
 const principalDraftKey = 'diagramcraft-principal-draft';
 const relationLabels = { asociacion: 'Asociación', agregacion: 'Agregación', composicion: 'Composición', herencia: 'Herencia', realizacion: 'Realización', dependencia: 'Dependencia' };
 const classNodeKinds = new Set(['class', 'entity']);
@@ -180,9 +184,21 @@ export default function DiagramCanvas({ onLogout }) {
   const [aiStatus, setAiStatus] = useState('inactivo');
   const [aiMessage, setAiMessage] = useState('');
   const [aiPlan, setAiPlan] = useState(null);
+  const [aiHistory, setAiHistory] = useState([]);
+  const [voicePreferences, setVoicePreferences] = useState(() => {
+    try {
+      return { ...DEFAULT_VOICE_PREFERENCES, ...JSON.parse(window.localStorage.getItem('diagramcraft-diana-voice-preferences') || '{}') };
+    } catch { return DEFAULT_VOICE_PREFERENCES; }
+  });
+  const [voices, setVoices] = useState([]);
+  const voiceEnabled = voicePreferences.enabled;
+  const [voiceState, setVoiceState] = useState('idle');
   const savingRef = useRef(false);
   const saveTimerRef = useRef(null);
   const saveQueuedRef = useRef(false);
+  const saveQueuedGenerationRef = useRef(null);
+  const saveAbortRef = useRef(null);
+  const authoritativeReloadRef = useRef(null);
   const diagramLoadedRef = useRef(false);
   const activeProjectRef = useRef(activeProjectId);
   const activeDiagramRef = useRef(activeDiagramId);
@@ -200,6 +216,18 @@ export default function DiagramCanvas({ onLogout }) {
   const aiAbortRef = useRef(null);
   const speechRecognitionRef = useRef(null);
   const speechTranscriptRef = useRef('');
+  const speechPausedRef = useRef(false);
+  const voiceEnabledRef = useRef(voiceEnabled);
+  const voicePreferencesRef = useRef(voicePreferences);
+  const voicesRef = useRef(voices);
+  const toggleVoiceRef = useRef(null);
+  const voiceSessionRef = useRef('idle');
+  const voiceRequestIdsRef = useRef(new Set());
+  const aiPlanRef = useRef(null);
+  const aiStatusRef = useRef('inactivo');
+  const voicePlanActionRef = useRef(false);
+  const localSocketRequestIdsRef = useRef(new Map());
+  const saveGenerationRef = useRef(0);
   const aiEchoRef = useRef(null);
   const diagramRevisionRef = useRef(null);
 
@@ -225,6 +253,95 @@ export default function DiagramCanvas({ onLogout }) {
     if (restore(loadPrincipalDraft())) scheduleCurrentSaveRef.current?.();
     setToast(message);
   }, [restore]);
+
+  const revisionOf = (document) => document?.revision ?? document?.version ?? document?.current_revision ?? null;
+  const isStaleRevision = isStaleRevisionPayload;
+  const rememberLocalSocketRequest = (requestId) => {
+    const now = Date.now();
+    for (const [id, createdAt] of localSocketRequestIdsRef.current) {
+      if (now - createdAt > 60_000) localSocketRequestIdsRef.current.delete(id);
+    }
+    localSocketRequestIdsRef.current.set(requestId, now);
+  };
+  useEffect(() => { aiPlanRef.current = aiPlan; }, [aiPlan]);
+  useEffect(() => { aiStatusRef.current = aiStatus; }, [aiStatus]);
+  const invalidatePendingSaves = useCallback(() => {
+    clearTimeout(saveTimerRef.current);
+    clearTimeout(socketSyncTimerRef.current);
+    saveQueuedRef.current = false;
+    saveQueuedGenerationRef.current = null;
+    saveGenerationRef.current += 1;
+    saveAbortRef.current?.abort();
+    saveAbortRef.current = null;
+    return saveGenerationRef.current;
+  }, []);
+  const replaceWithAuthoritativeDocument = useCallback((document, diagramId, { recordHistory = false, markAiEcho = false } = {}) => {
+    if (!Array.isArray(document?.nodes) || !Array.isArray(document?.edges)
+      || String(diagramId) !== String(activeDiagramRef.current)) return false;
+    invalidatePendingSaves();
+    const viewport = reactFlowRef.current?.getViewport?.();
+    restore({ nodes: document.nodes, edges: document.edges }, { preserveSelection: true, recordHistory });
+    const restored = useDiagramStore.getState();
+    diagramStateRef.current = { nodes: restored.nodes, edges: restored.edges };
+    diagramRevisionRef.current = revisionOf(document) ?? diagramRevisionRef.current;
+    hasPendingChangesRef.current = false;
+    if (markAiEcho) aiEchoRef.current = JSON.stringify(diagramStateRef.current);
+    setSaveStatus('saved');
+    window.requestAnimationFrame(() => { if (viewport) reactFlowRef.current?.setViewport?.(viewport); });
+    return true;
+  }, [invalidatePendingSaves, restore]);
+  const addAiHistory = (role, message) => {
+    if (message) setAiHistory((items) => [...items, { id: `${Date.now()}-${Math.random()}`, role, message }].slice(-6));
+  };
+  const speakDiana = useCallback((message, { resumeListening = false } = {}) => {
+    if (!voiceEnabledRef.current || !window.speechSynthesis || !message) return;
+    const phrases = speechSegments(message);
+    if (!phrases.length) return;
+    speechPausedRef.current = true;
+    speechRecognitionRef.current?.abort();
+    speechRecognitionRef.current = null;
+    window.speechSynthesis.cancel();
+    const preferences = voicePreferencesRef.current;
+    const voice = selectBestSpanishVoice(voicesRef.current, preferences.voiceURI);
+    const speakNext = (index) => {
+      const utterance = new SpeechSynthesisUtterance(phrases[index]);
+      utterance.lang = voice?.lang || import.meta.env.VITE_SPEECH_LANGUAGE || 'es-BO';
+      utterance.rate = preferences.rate;
+      utterance.pitch = preferences.pitch;
+      utterance.volume = 1;
+      if (voice) utterance.voice = voice;
+      utterance.onend = utterance.onerror = () => {
+        if (index + 1 < phrases.length) { speakNext(index + 1); return; }
+        speechPausedRef.current = false;
+        if (resumeListening && ['instruction', 'confirmation'].includes(voiceSessionRef.current)) window.setTimeout(() => toggleVoiceRef.current?.(), 100);
+      };
+      window.speechSynthesis.speak(utterance);
+    };
+    speakNext(0);
+  }, []);
+  const restoreAuthoritativeDocument = useCallback(async (message = 'El diagrama cambió en otra sesión; se cargó la versión más reciente.') => {
+    const diagramId = activeDiagramRef.current;
+    if (!diagramId) return false;
+    if (authoritativeReloadRef.current?.diagramId === String(diagramId)) return authoritativeReloadRef.current.promise;
+    const generation = invalidatePendingSaves();
+    let completeReload;
+    const reloadPromise = new Promise((resolve) => { completeReload = resolve; });
+    authoritativeReloadRef.current = { diagramId: String(diagramId), promise: reloadPromise };
+    try {
+      const diagram = await obtenerDiagrama(diagramId);
+      if (generation !== saveGenerationRef.current || String(diagramId) !== String(activeDiagramRef.current)) return false;
+      if (!replaceWithAuthoritativeDocument(contenidoDiagrama(diagram), diagramId)) return false;
+      if (message) setToast(message);
+      return true;
+    } catch {
+      setSaveStatus('error');
+      setToast('Hay un conflicto de revisión y no se pudo recargar el diagrama. Recarga la página antes de continuar.');
+      return false;
+    } finally {
+      completeReload?.(true);
+      if (authoritativeReloadRef.current?.promise === reloadPromise) authoritativeReloadRef.current = null;
+    }
+  }, [invalidatePendingSaves, replaceWithAuthoritativeDocument]);
 
   const onSocketMessage = useCallback((event) => {
     const removalEvents = ['member.removed', 'collaborator.removed', 'project.member.removed'];
@@ -255,26 +372,29 @@ export default function DiagramCanvas({ onLogout }) {
       return;
     }
     if (event?.type === 'diagram.error') {
+      if (event.code === 'stale_revision' || event?.error?.code === 'stale_revision') {
+        const ownEvent = isOwnSocketEvent(event, diagramStateRef.current, localSocketRequestIdsRef.current);
+        restoreAuthoritativeDocument(ownEvent ? null : 'El diagrama cambió en otra sesión. Se cargó la versión actual para evitar sobrescribir cambios.');
+        return;
+      }
       setToast(`Error de sincronización: ${event.detail || 'el servidor rechazó el cambio.'}`);
       return;
     }
     if (event?.type !== 'diagram.update' || String(event.diagram_id) !== String(activeDiagramRef.current)) return;
     if (Array.isArray(event.nodes) && Array.isArray(event.edges)) {
+      const incomingRevision = revisionOf(event);
+      const currentRevision = diagramRevisionRef.current;
+      const ownEvent = isOwnSocketEvent(event, diagramStateRef.current, localSocketRequestIdsRef.current);
       const incoming = JSON.stringify({ nodes: event.nodes, edges: event.edges });
       if (aiEchoRef.current && incoming === aiEchoRef.current) {
         aiEchoRef.current = null;
         return;
       }
-      // restore escribe directamente nodes/edges en el store, equivalente a
-      // setNodes(event.nodes) y setEdges(event.edges) de React Flow.
-      const migrated = restore({ nodes: event.nodes, edges: event.edges }, { preserveSelection: true });
-      const restored = useDiagramStore.getState();
-      diagramStateRef.current = { nodes: restored.nodes, edges: restored.edges };
-      hasPendingChangesRef.current = false;
-      setSaveStatus('saved');
-      if (migrated) scheduleCurrentSaveRef.current?.();
+      if (!shouldReplaceRemoteDocument(incomingRevision, currentRevision)) return;
+      const replaced = replaceWithAuthoritativeDocument({ nodes: event.nodes, edges: event.edges, revision: incomingRevision }, event.diagram_id);
+      if (replaced && !ownEvent) setToast('El diagrama cambió en otra sesión. Se cargó la versión actual para evitar sobrescribir cambios.');
     }
-  }, [restore, returnToPrincipalCanvas]);
+  }, [replaceWithAuthoritativeDocument, returnToPrincipalCanvas, restoreAuthoritativeDocument]);
   const { status: socketStatus, send: sendSocketEvent } = useDiagramSocket(activeDiagramId, onSocketMessage);
 
   useEffect(() => {
@@ -286,42 +406,61 @@ export default function DiagramCanvas({ onLogout }) {
     if (socketStatus === 'connected' && activeDiagramId) sendSocketEvent({ type: 'presence.join', diagram_id: activeDiagramId });
   }, [activeDiagramId, sendSocketEvent, socketStatus]);
 
-  async function persistPendingChanges({ silent = false } = {}) {
+  async function persistPendingChanges({ silent = false, scheduledGeneration = saveGenerationRef.current, scheduledRevision = diagramRevisionRef.current } = {}) {
     if (!diagramLoadedRef.current || !activeProjectRef.current || !hasPendingChangesRef.current) return true;
-    if (savingRef.current) { saveQueuedRef.current = true; return false; }
+    if (!saveSnapshotIsCurrent({ scheduledGeneration, currentGeneration: saveGenerationRef.current, scheduledRevision, currentRevision: diagramRevisionRef.current })) return false;
+    if (savingRef.current) { saveQueuedRef.current = true; saveQueuedGenerationRef.current = scheduledGeneration; return false; }
     savingRef.current = true;
+    const diagramId = activeDiagramRef.current;
+    const contenido = { nodes: diagramStateRef.current.nodes, edges: diagramStateRef.current.edges };
+    const controller = new AbortController();
+    saveAbortRef.current = controller;
     setSaveStatus('saving');
-    const contenido = diagramStateRef.current;
     try {
-      if (activeDiagramRef.current) {
-        await guardarDiagrama(activeDiagramRef.current, contenido);
+      if (diagramId) {
+        const saved = await guardarDiagrama(diagramId, contenido, scheduledRevision, { signal: controller.signal });
+        if (!saveSnapshotIsCurrent({ scheduledGeneration, currentGeneration: saveGenerationRef.current, scheduledRevision, currentRevision: diagramRevisionRef.current }) || String(diagramId) !== String(activeDiagramRef.current)) return false;
+        return replaceWithAuthoritativeDocument(saved, diagramId);
       } else {
         const diagram = await crearDiagramaPrincipal(activeProjectRef.current, contenido);
+        if (scheduledGeneration !== saveGenerationRef.current) return false;
         activeDiagramRef.current = diagram.id;
+        diagramRevisionRef.current = revisionOf(diagram);
         setActiveDiagramId(diagram.id);
       }
       hasPendingChangesRef.current = false;
       setSaveStatus('saved');
       return true;
     } catch (requestError) {
+      if (isStaleRevision(requestError)) {
+        invalidatePendingSaves();
+        await restoreAuthoritativeDocument('Tu guardado usaba una revisión anterior. Se restauró el diagrama actual para evitar sobrescribir cambios remotos.');
+        setToast('El diagrama cambió en otra sesión. Se cargó la versión actual para evitar sobrescribir cambios.');
+        return false;
+      }
+      if (requestError.code === 'ERR_CANCELED') return false;
       setSaveStatus('error');
       if (!silent) setToast(saveErrorMessage(requestError.response?.data) || 'No se pudo guardar el diagrama.');
       return false;
     } finally {
       savingRef.current = false;
-      if (saveQueuedRef.current) {
+      if (saveAbortRef.current === controller) saveAbortRef.current = null;
+      if (saveQueuedRef.current && saveQueuedGenerationRef.current === saveGenerationRef.current && hasPendingChangesRef.current) {
         saveQueuedRef.current = false;
+        saveQueuedGenerationRef.current = null;
         setSaveStatus('pending');
-        saveTimerRef.current = setTimeout(() => { persistPendingChanges(); }, 700);
+        scheduleSave();
       }
     }
   }
 
   function scheduleSave() {
     if (!diagramLoadedRef.current || !activeProjectRef.current) return;
+    const scheduledGeneration = saveGenerationRef.current;
+    const scheduledRevision = diagramRevisionRef.current;
     clearTimeout(saveTimerRef.current);
     setSaveStatus('pending');
-    saveTimerRef.current = setTimeout(() => { persistPendingChanges(); }, 700);
+    saveTimerRef.current = setTimeout(() => { persistPendingChanges({ scheduledGeneration, scheduledRevision }); }, 700);
   }
 
   function scheduleCurrentSave() {
@@ -333,85 +472,101 @@ export default function DiagramCanvas({ onLogout }) {
       setSaveStatus('local');
       return;
     }
-    if (canEditRef.current && activeDiagramRef.current) {
-      clearTimeout(socketSyncTimerRef.current);
-      socketSyncTimerRef.current = setTimeout(() => {
-        sendSocketEvent({
-          type: 'diagram.update',
-          diagram_id: activeDiagramRef.current,
-          nodes: diagramStateRef.current.nodes,
-          edges: diagramStateRef.current.edges,
-        });
-      }, 80);
-    }
+    // REST es el único escritor del documento. El backend publica el estado
+    // persistido por WebSocket después de guardar, evitando una carrera entre
+    // un diagram.update local y el PATCH de autosave.
     scheduleSave();
   }
 
   const isCurrentAiRequest = (requestId, diagramId) => requestId === aiRequestRef.current && String(diagramId) === String(activeDiagramRef.current);
   const aiSelection = () => ({ node_ids: selectedNodeId ? [selectedNodeId] : [], edge_ids: highlightedEdgeId ? [highlightedEdgeId] : [] });
   const applyAuthoritativeAiResult = (payload, diagramId) => {
-    const document = payload?.diagram || payload?.result || payload;
+    const document = payload?.diagram && String(payload.diagram.id) === String(diagramId)
+      ? payload.diagram
+      : payload?.result || payload;
     if (!Array.isArray(document?.nodes) || !Array.isArray(document?.edges) || String(diagramId) !== String(activeDiagramRef.current)) return false;
-    clearTimeout(saveTimerRef.current);
-    clearTimeout(socketSyncTimerRef.current);
-    saveQueuedRef.current = false;
-    const viewport = reactFlowRef.current?.getViewport?.();
-    restore({ nodes: document.nodes, edges: document.edges }, { preserveSelection: true, recordHistory: true });
-    const restored = useDiagramStore.getState();
-    diagramStateRef.current = { nodes: restored.nodes, edges: restored.edges };
-    hasPendingChangesRef.current = false;
-    diagramRevisionRef.current = document.revision ?? document.version ?? payload?.revision ?? payload?.version ?? diagramRevisionRef.current;
-    aiEchoRef.current = JSON.stringify(diagramStateRef.current);
-    setSaveStatus('saved');
-    window.requestAnimationFrame(() => { if (viewport) reactFlowRef.current?.setViewport?.(viewport); });
-    return true;
+    return replaceWithAuthoritativeDocument({
+      ...document,
+      revision: document.revision ?? document.version ?? payload?.revision ?? payload?.version,
+    }, diagramId, { recordHistory: true, markAiEcho: true });
   };
   const applyCurrentAiPlan = async (plan, confirm = true) => {
     const diagramId = activeDiagramRef.current;
     if (!plan?.plan_id || !diagramId) return;
+    invalidatePendingSaves();
     const requestId = ++aiRequestRef.current;
     aiAbortRef.current?.abort();
     const controller = new AbortController();
     aiAbortRef.current = controller;
+    const idempotencyKey = createRequestId();
+    rememberLocalSocketRequest(idempotencyKey);
     setAiStatus('aplicando');
     setAiMessage('Aplicando el plan autorizado…');
     try {
       const { data } = await applyAiPlan(diagramId, {
         plan_id: plan.plan_id,
-        idempotency_key: crypto.randomUUID?.() || `ai-${Date.now()}-${Math.random().toString(36).slice(2)}`,
+        idempotency_key: idempotencyKey,
         confirm,
+        expected_revision: diagramRevisionRef.current,
+        request_id: plan.request_id,
       }, { signal: controller.signal });
       if (!isCurrentAiRequest(requestId, diagramId)) return;
       if (!applyAuthoritativeAiResult(data, diagramId)) throw new Error('El servidor no devolvió un diagrama autorizado.');
+      aiPlanRef.current = null;
       setAiPlan(null);
+      voiceSessionRef.current = 'idle';
+      setVoiceState('idle');
       setAiStatus('exito');
+      if (data?.project?.id && data?.diagram?.id) {
+        const availableProjects = await refreshProjects();
+        const createdProject = availableProjects.find((project) => String(project.id) === String(data.project.id));
+        if (createdProject) await openProject(createdProject, true);
+      }
+      speakDiana(data?.summary || data?.message || 'Listo, apliqué el plan al diagrama.');
+      addAiHistory('diana', data?.summary || data?.message || 'Plan aplicado de forma segura.');
       setAiMessage(data?.summary || data?.message || 'Instrucción aplicada correctamente.');
       setToast('El Agente IA actualizó el diagrama.');
     } catch (requestError) {
       if (requestError.code === 'ERR_CANCELED' || !isCurrentAiRequest(requestId, diagramId)) return;
+      if (isStaleRevision(requestError)) {
+        aiPlanRef.current = null;
+        setAiPlan(null);
+        await restoreAuthoritativeDocument('El plan usaba una revisión anterior y no se aplicó. Se cargó la versión actual.');
+        setAiStatus('error');
+        setAiMessage('El plan está desactualizado; vuelve a pedirlo sobre el diagrama actual.');
+        return;
+      }
       setAiStatus('error');
       setAiMessage(requestError.response?.data?.detail || requestError.response?.data?.message || 'No se pudo aplicar el plan; el lienzo no fue modificado.');
+      const issue = requestError.response?.data;
+      if (issue?.target || issue?.node_id || issue?.edge_id) focusGenerationIssue(issue.target ? { element_id: issue.target } : issue);
     } finally {
       if (isCurrentAiRequest(requestId, diagramId)) aiAbortRef.current = null;
     }
   };
-  const interpretAiCommand = async (instruction) => {
+  const interpretAiCommand = async (instruction, suppliedRequestId) => {
     const diagramId = activeDiagramRef.current;
     if (!instruction?.trim()) { setAiStatus('error'); setAiMessage('Escribe una instrucción antes de enviarla.'); return; }
     if (!diagramId) { setAiStatus('error'); setAiMessage('Selecciona un diagrama guardado antes de usar el Agente IA.'); return; }
     if (isReadOnly) { setAiStatus('error'); setAiMessage('No tienes permiso para modificar este diagrama.'); return; }
     clearTimeout(saveTimerRef.current);
+    clearTimeout(socketSyncTimerRef.current);
     const saved = await persistPendingChanges({ silent: true });
     if (!saved || String(diagramId) !== String(activeDiagramRef.current)) { setAiStatus('error'); setAiMessage('No se pudieron sincronizar los cambios pendientes antes de interpretar.'); return; }
+    const voiceRequestId = suppliedRequestId || createRequestId();
+    if (voiceRequestIdsRef.current.has(voiceRequestId)) return;
+    voiceRequestIdsRef.current.add(voiceRequestId);
     const requestId = ++aiRequestRef.current;
     aiAbortRef.current?.abort();
     const controller = new AbortController();
     aiAbortRef.current = controller;
     setAiStatus('interpretando');
     setAiMessage('Interpretando la instrucción…');
+    aiPlanRef.current = null;
     setAiPlan(null);
+    addAiHistory('usuario', instruction.trim());
     try {
-      const { data } = await interpretAi(diagramId, instruction.trim(), aiSelection(), { signal: controller.signal });
+      const { data } = await interpretAi(diagramId, instruction.trim(), aiSelection(), { signal: controller.signal, expectedRevision: diagramRevisionRef.current, requestId: voiceRequestId });
       if (!isCurrentAiRequest(requestId, diagramId)) return;
       const status = String(data?.status || data?.type || data?.kind || 'ready').toLowerCase();
       if (status === 'clarification' || status === 'aclaracion') {
@@ -426,12 +581,21 @@ export default function DiagramCanvas({ onLogout }) {
         return;
       }
       const plan = data?.plan || data;
-      const normalizedPlan = { ...plan, plan_id: plan.plan_id || plan.id || data?.plan_id, summary: plan.summary || data?.summary || data?.message || 'Plan listo para aplicar.' };
+      const normalizedPlan = { ...plan, plan_id: plan.plan_id || plan.id || data?.plan_id, request_id: voiceRequestId, summary: plan.summary || data?.summary || data?.message || 'Plan listo para aplicar.' };
       if (!normalizedPlan.plan_id) throw new Error('La respuesta no contiene un plan aplicable.');
-      if (data?.requires_confirmation || plan?.requires_confirmation) {
+      addAiHistory('diana', normalizedPlan.summary);
+      const destructive = planNeedsConfirmation(data, plan);
+      if (destructive) {
+        aiPlanRef.current = normalizedPlan;
         setAiPlan(normalizedPlan);
         setAiStatus('confirmacion');
-        setAiMessage(normalizedPlan.summary);
+        voiceSessionRef.current = 'confirmation';
+        const isProjectPlan = (plan.operations || data.operations || []).some((operation) => (operation.op || operation.type) === 'project.create');
+        const confirmationMessage = isProjectPlan
+          ? `Perfecto. ${normalizedPlan.summary} Di “confirmar” o pulsa Confirmar.`
+          : `${normalizedPlan.summary} Di “confirmar” o pulsa Confirmar.`;
+        setAiMessage(confirmationMessage);
+        speakDiana(confirmationMessage, { resumeListening: true });
         return;
       }
       await applyCurrentAiPlan(normalizedPlan, true);
@@ -443,10 +607,30 @@ export default function DiagramCanvas({ onLogout }) {
       if (isCurrentAiRequest(requestId, diagramId)) aiAbortRef.current = null;
     }
   };
-  const cancelAi = () => { aiRequestRef.current += 1; aiAbortRef.current?.abort(); aiAbortRef.current = null; setAiPlan(null); setAiStatus('inactivo'); setAiMessage(''); };
+  const cancelAi = () => {
+    aiRequestRef.current += 1;
+    aiAbortRef.current?.abort();
+    aiAbortRef.current = null;
+    voiceSessionRef.current = 'idle';
+    setVoiceState('idle');
+    aiPlanRef.current = null;
+    setAiPlan(null);
+    setAiStatus('inactivo');
+    setAiMessage('Plan cancelado.');
+  };
+  const stopVoiceRecognition = () => {
+    voiceSessionRef.current = 'idle';
+    speechRecognitionRef.current?.abort();
+    speechRecognitionRef.current = null;
+    setVoiceState('idle');
+    setAiStatus('inactivo');
+  };
   const toggleVoiceRecognition = () => {
     const ActiveRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
-    if (speechRecognitionRef.current) { speechRecognitionRef.current.abort(); speechRecognitionRef.current = null; setAiStatus('inactivo'); setAiMessage('Reconocimiento de voz detenido.'); return; }
+    if (speechRecognitionRef.current) { stopVoiceRecognition(); setAiMessage('Reconocimiento de voz detenido.'); return; }
+    voiceEnabledRef.current = true;
+    setVoicePreferences((preferences) => ({ ...preferences, enabled: true }));
+    voiceSessionRef.current = ['instruction', 'confirmation'].includes(voiceSessionRef.current) ? voiceSessionRef.current : 'wake';
     if (!ActiveRecognition) { setAiStatus('error'); setAiMessage('Este navegador no admite reconocimiento de voz. Puedes escribir la instrucción.'); return; }
     const recognition = new ActiveRecognition();
     recognition.lang = import.meta.env.VITE_SPEECH_LANGUAGE || 'es-ES';
@@ -457,21 +641,140 @@ export default function DiagramCanvas({ onLogout }) {
       const transcript = Array.from(event.results).filter((result) => result.isFinal).map((result) => result[0]?.transcript?.trim()).filter(Boolean).join(' ');
       if (!transcript || transcript === speechTranscriptRef.current) return;
       speechTranscriptRef.current = transcript;
+      const pendingPlan = aiPlanRef.current;
+      const action = voiceFinalAction(transcript, voiceSessionRef.current, Boolean(pendingPlan));
+      console.debug('[Diana voz] transcripción final', {
+        transcript, normalized: normalizeVoiceTranscript(transcript), action,
+        hasPendingPlan: Boolean(pendingPlan), status: aiStatusRef.current,
+      });
+      const stopCommandRecognition = () => {
+        voiceSessionRef.current = 'idle';
+        speechRecognitionRef.current?.abort();
+        speechRecognitionRef.current = null;
+        setVoiceState('idle');
+      };
+      if (action === 'stop') {
+        stopVoiceRecognition();
+        setAiMessage('De acuerdo, dejaré de escuchar.');
+        speakDiana('De acuerdo, dejaré de escuchar.');
+        return;
+      }
+      if (action === 'cancel') {
+        console.debug('[Diana voz] cancelando plan pendiente');
+        stopCommandRecognition();
+        cancelAi();
+        setAiMessage('Plan cancelado.');
+        return;
+      }
+      if (action === 'confirm') {
+        if (!pendingPlan || voicePlanActionRef.current || ['aplicando', 'interpretando'].includes(aiStatusRef.current) || aiAbortRef.current) return;
+        voicePlanActionRef.current = true;
+        stopCommandRecognition();
+        setAiMessage('Confirmando el plan…');
+        console.debug('[Diana voz] aplicando plan confirmado', { planId: pendingPlan.plan_id });
+        applyCurrentAiPlan(pendingPlan, true).finally(() => { voicePlanActionRef.current = false; });
+        return;
+      }
+      if (action === 'confirm_without_plan' || action === 'cancel_without_plan') {
+        stopCommandRecognition();
+        setAiMessage('No hay un plan pendiente para confirmar o cancelar.');
+        return;
+      }
       setAiCommand(transcript);
+      if (voiceSessionRef.current === 'wake') {
+        if (action === 'wake') {
+          voiceSessionRef.current = 'instruction';
+          speechTranscriptRef.current = '';
+          setVoiceState('instruction');
+          setAiStatus('escuchando');
+          speakDiana('Hola, soy Diana. ¿Qué necesitas modelar?', { resumeListening: true });
+          setAiMessage('Hola, soy Diana. Te escucho.');
+          return;
+        }
+        setAiMessage('Di “Hola Diana” para iniciar una instrucción.');
+        return;
+      }
+      if (action === 'send') {
+        voiceSessionRef.current = 'idle';
+        setVoiceState('idle');
+        const instruction = transcript.replace(/^\s*diana\s*,?\s*/i, '');
+        interpretAiCommand(instruction, crypto.randomUUID?.() || `voice-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        return;
+      }
       setAiStatus('inactivo');
       setAiMessage('Transcripción lista para revisar y enviar.');
     };
     recognition.onerror = (event) => {
+      if (event.error === 'aborted') return;
+      const pendingPlan = aiPlanRef.current;
+      const voiceError = voiceRecognitionError(event.error, Boolean(pendingPlan));
+      console.debug('[Diana voz] error de reconocimiento', { error: event.error, hasPendingPlan: Boolean(pendingPlan) });
+      if (voiceError.preservePendingPlan) {
+        voiceSessionRef.current = 'confirmation';
+        speechRecognitionRef.current = null;
+        setVoiceState('idle');
+        setAiStatus('confirmacion');
+        setAiMessage(voiceError.message);
+        return;
+      }
       const messages = { 'not-allowed': 'Permiso de micrófono denegado.', 'service-not-allowed': 'El navegador no permite el servicio de voz.', 'no-speech': 'No se detectó voz. Inténtalo otra vez.', network: 'Error de red en el reconocimiento de voz.', aborted: 'Reconocimiento de voz detenido.' };
       setAiStatus('error'); setAiMessage(messages[event.error] || 'No se pudo reconocer la voz. Puedes escribir la instrucción.');
     };
-    recognition.onend = () => { if (speechRecognitionRef.current === recognition) speechRecognitionRef.current = null; setAiStatus((current) => current === 'escuchando' ? 'inactivo' : current); };
+    recognition.onend = () => {
+      if (speechRecognitionRef.current === recognition) speechRecognitionRef.current = null;
+      if (voiceSessionRef.current === 'instruction' && !speechPausedRef.current) { window.setTimeout(toggleVoiceRecognition, 0); return; }
+      setVoiceState('idle');
+      setAiStatus((current) => current === 'escuchando' ? 'inactivo' : current);
+    };
     speechRecognitionRef.current = recognition;
     setAiStatus('escuchando');
+    setVoiceState(voiceSessionRef.current);
     setAiMessage('Escuchando… habla y revisa la transcripción antes de enviarla.');
-    recognition.start();
+    setAiMessage(voiceSessionRef.current === 'confirmation'
+      ? 'Escuchando confirmación: di “confirmar” o “cancelar”.'
+      : voiceSessionRef.current === 'instruction'
+      ? 'Hola, soy Diana. Te escucho: di una sola instrucción para el diagrama.'
+      : 'Escuchando. Di “Hola Diana” para iniciar una instrucción.');
+    try {
+      console.debug('[Diana voz] iniciando reconocimiento', { session: voiceSessionRef.current, hasPendingPlan: Boolean(aiPlanRef.current) });
+      recognition.start();
+    }
+    catch { speechRecognitionRef.current = null; setVoiceState('idle'); setAiStatus('error'); setAiMessage('No se pudo iniciar el micrófono. Revisa el permiso de Edge o usa la entrada de texto.'); }
   };
-  useEffect(() => () => { aiRequestRef.current += 1; aiAbortRef.current?.abort(); speechRecognitionRef.current?.abort(); speechRecognitionRef.current = null; }, [activeDiagramId]);
+  useEffect(() => { toggleVoiceRef.current = toggleVoiceRecognition; });
+  useEffect(() => () => {
+    aiRequestRef.current += 1;
+    aiAbortRef.current?.abort();
+    saveAbortRef.current?.abort();
+    clearTimeout(saveTimerRef.current);
+    clearTimeout(socketSyncTimerRef.current);
+    speechRecognitionRef.current?.abort();
+    speechRecognitionRef.current = null;
+  }, [activeDiagramId]);
+  useEffect(() => {
+    const synth = window.speechSynthesis;
+    if (!synth) return undefined;
+    const loadVoices = () => setVoices(synth.getVoices());
+    loadVoices();
+    synth.addEventListener?.('voiceschanged', loadVoices);
+    return () => synth.removeEventListener?.('voiceschanged', loadVoices);
+  }, []);
+  useEffect(() => {
+    voiceEnabledRef.current = voicePreferences.enabled;
+    voicePreferencesRef.current = voicePreferences;
+    window.localStorage.setItem('diagramcraft-diana-voice-preferences', JSON.stringify(voicePreferences));
+  }, [voicePreferences]);
+  useEffect(() => {
+    const updatePreferences = (event) => setVoicePreferences((current) => ({ ...current, ...event.detail }));
+    const previewVoice = () => speakDiana('Hola, soy Diana. ¿Qué te gustaría modelar?');
+    window.addEventListener('diana-voice-settings', updatePreferences);
+    window.addEventListener('diana-voice-preview', previewVoice);
+    return () => {
+      window.removeEventListener('diana-voice-settings', updatePreferences);
+      window.removeEventListener('diana-voice-preview', previewVoice);
+    };
+  }, [speakDiana]);
+  useEffect(() => { voicesRef.current = voices; }, [voices]);
   useEffect(() => {
     scheduleCurrentSaveRef.current = scheduleCurrentSave;
   });
@@ -528,8 +831,9 @@ export default function DiagramCanvas({ onLogout }) {
   // Este cleanup debe ejecutarse únicamente al desmontar el editor. Si se
   // ejecuta tras cada render, cancela el envío WebSocket programado al arrastrar.
   useEffect(() => {
+    const socketSyncTimer = socketSyncTimerRef.current;
     return () => {
-      clearTimeout(socketSyncTimerRef.current);
+      clearTimeout(socketSyncTimer);
       setDiagramMutationListener(null);
     };
   }, []);
@@ -993,6 +1297,10 @@ export default function DiagramCanvas({ onLogout }) {
       <div className="ml-1 flex shrink-0 gap-1"><button onClick={() => setShareOpen(true)} className="flex items-center gap-1 rounded-lg bg-gradient-to-r from-indigo-600 to-violet-600 px-3 py-2.5 text-[11px] font-bold text-white hover:from-indigo-500 hover:to-violet-500"><FiShare2 /> Compartir / Invitar</button><button onClick={generateSpringBoot} disabled={generating || isReadOnly || !activeDiagramId} className="flex items-center gap-1 rounded-lg bg-indigo-500 px-3 py-2.5 text-[11px] font-bold text-white hover:bg-indigo-400 disabled:cursor-wait disabled:opacity-55"><FiZap className="text-yellow-200" /> {generating ? 'Generando…' : 'Generar 4 Capas'}</button><button onClick={onLogout} title="Cerrar sesión" className="rounded-lg bg-rose-600 p-2.5 text-white hover:bg-rose-500"><FiLogOut /></button></div>
     </header>
     <div className="flex min-h-0 flex-1"><div className={`relative z-20 shrink-0 transition-[width] duration-300 ${sidebarOpen ? 'w-80' : 'w-0'}`}><div className="h-full overflow-hidden"><EditorToolbar readOnly={isReadOnly} canUseRelations={canUseRelations} onlineMembers={onlineMembers} nodes={nodes} edges={edges} generating={generating} command={aiCommand} onCommandChange={setAiCommand} aiStatus={aiStatus} aiMessage={aiMessage} aiPlan={aiPlan} listening={aiStatus === 'escuchando'} onCreate={(kind) => canEdit && createNode(kind)} onRelation={(type) => canUseRelations && setRelationType(type)} onCommand={interpretAiCommand} onListen={toggleVoiceRecognition} onConfirmAi={() => applyCurrentAiPlan(aiPlan, true)} onCancelAi={cancelAi} onGenerate={generateSpringBoot} /></div><button onClick={() => setSidebarOpen((open) => !open)} title={sidebarOpen ? 'Ocultar panel' : 'Mostrar panel'} className={`absolute top-4 z-30 grid h-8 w-5 place-items-center rounded-r-md border border-l-0 border-slate-600 bg-[#17233f] text-slate-300 shadow-lg hover:bg-indigo-600 ${sidebarOpen ? '-right-5' : 'left-0'}`}>{sidebarOpen ? <FiChevronLeft /> : <FiChevronRight />}</button></div><main className="relative flex-1 bg-[#080f21]"><ReactFlow onInit={(instance) => { reactFlowRef.current = instance; }} nodes={canvasNodes} edges={canvasEdges} nodesDraggable={canEdit} nodesConnectable={canUseRelations} connectionMode={ConnectionMode.Loose} elementsSelectable={canEdit} onNodesChange={canEdit ? onNodesChange : undefined} onEdgesChange={canEdit ? onEdgesChange : undefined} onConnect={canUseRelations ? onConnect : undefined} onReconnect={canUseRelations ? reconnectRelation : undefined} onNodeClick={(event, node) => { closeRelationEditor(); setNodeMenu(null); setRelationMenu(null); selectNode(node.id); setEditorPosition({ x: event.clientX, y: event.clientY }); }} onPaneClick={() => { closeRelationEditor(); selectNode(null); setNodeMenu(null); setRelationMenu(null); }} nodeTypes={nodeTypes} edgeTypes={edgeTypes} fitView><ImportedNodeInternalsRefresher refreshToken={importLayoutRefresh} nodeIds={nodes.map((node) => node.id).join('|')} /><Background color="#52607a" gap={26} size={1.2} /><Controls className="!border-slate-700 !bg-[#101a31] !fill-slate-200" /><MiniMap className="!border !border-slate-700 !bg-[#101a31]" nodeColor="#6366f1" /></ReactFlow>{canUseRelations && <PropertiesPanel node={selectedNode} position={editorPosition} onClose={() => { selectNode(null); setEditorPosition(null); }} onUpdate={(patch) => updateNode(selectedNode.id, patch)} onAddAttribute={() => addAttribute(selectedNode.id, index)} onUpdateAttribute={(index, patch) => updateAttribute(selectedNode.id, index, patch)} onRemoveAttribute={(index) => removeAttribute(selectedNode.id, index)} onAddMethod={() => addMethod(selectedNode.id)} onUpdateMethod={(index, value) => updateMethod(selectedNode.id, index, value)} onRemoveMethod={(index) => removeMethod(selectedNode.id, index)} onDelete={() => requestDeleteNode(selectedNode.id)} />}<div className={`absolute bottom-3 left-4 rounded bg-[#101a31]/90 px-3 py-1.5 font-mono text-[10px] ${syncIndicator.color}`}>● {isReadOnly ? 'Modo solo lectura' : syncIndicator.label}</div></main></div>
+    <div aria-live="polite" className="fixed right-4 top-[76px] z-30 max-w-xs rounded-lg border border-indigo-400/30 bg-[#0d162d]/95 px-3 py-2 text-[10px] text-indigo-100 shadow-lg">
+      <div className="font-bold text-cyan-200">Diana · {voiceState === 'idle' ? (voiceEnabled ? 'voz preparada' : 'texto listo') : 'micrófono activo'}</div>
+      {aiHistory.slice(-2).map((entry) => <p key={entry.id} className="mt-1 truncate text-slate-300"><b>{entry.role === 'diana' ? 'Diana' : 'Tú'}:</b> {entry.message}</p>)}
+    </div>
     {toast && <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded bg-[#18264a] px-4 py-3">{toast}</div>}
     {generationErrors.length > 0 && <GenerationErrorDialog errors={generationErrors} onClose={() => { setGenerationErrors([]); setHighlightedEdgeId(null); }} onFocus={(issue) => { focusGenerationIssue(issue); setGenerationErrors([]); }} />}
     {pendingXmiFile && <XmiImportConfirmation file={pendingXmiFile} busy={xmiBusy} onClose={() => !xmiBusy && setPendingXmiFile(null)} onConfirm={confirmXmiImport} />}

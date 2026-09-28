@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "vite build",
     "lint": "eslint .",
+    "test": "node --test src/utils/aiFlow.test.js src/utils/dianaVoice.test.js src/utils/collaborationSync.test.js",
     "preview": "vite preview"
   },
   "dependencies": {

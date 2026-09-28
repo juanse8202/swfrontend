@@ -40,11 +40,17 @@ export async function crearDiagramaPrincipal(proyectoId, contenido) {
   return data;
 }
 
-export async function guardarDiagrama(diagramaId, contenido) {
+export async function guardarDiagrama(diagramaId, contenido, expectedRevision, options = {}) {
   const { data } = await api.patch(`/diagramas/diagramas/${diagramaId}/`, {
     nodes: contenido.nodes || [],
     edges: contenido.edges || [],
-  });
+    expected_revision: expectedRevision,
+  }, options);
+  return data;
+}
+
+export async function obtenerDiagrama(diagramaId) {
+  const { data } = await api.get(`/diagramas/diagramas/${diagramaId}/`);
   return data;
 }
 
