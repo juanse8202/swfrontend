@@ -1,4 +1,5 @@
 import api from './axios';
+import { postXmiFormData } from './xmiApiContract';
 
 const list = (payload) => (Array.isArray(payload) ? payload : payload?.results || []);
 const projectIdOf = (project) => (typeof project === 'object' ? project?.id : project);
@@ -64,11 +65,10 @@ export function exportarXmi(diagramaId) {
   return api.get(`/diagramas/diagramas/${diagramaId}/exportar-xmi/`, { responseType: 'arraybuffer' });
 }
 
-export function importarXmi(diagramaId, file) {
-  const form = new FormData();
-  form.append('file', file);
-  form.append('mode', 'replace');
-  return api.post(`/diagramas/diagramas/${diagramaId}/importar-xmi/`, form);
+// The caller owns the multipart contract.  Do not rebuild or wrap this
+// FormData here: doing so can silently omit dry_run before it reaches Django.
+export async function importarXmi(diagramaId, formData, requestOptions = {}, httpClient = api) {
+  return postXmiFormData(httpClient, diagramaId, formData, requestOptions);
 }
 
 export async function obtenerDiagramaPrincipal(proyecto) {

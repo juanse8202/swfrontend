@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { FiActivity, FiCpu, FiLink, FiMic, FiPlus, FiStar, FiVolume2 } from 'react-icons/fi';
+import { relationPlanPreview } from '../../utils/aiFlow';
 
 const nodeTypes = [
   ['entity', '@Entity', 'Tabla relacional con PK UUID/Long', 'bg-indigo-400'],
@@ -61,6 +62,7 @@ function previewOperation(operation) {
     return `Crear ${operation.kind === 'entity' ? 'entidad' : operation.kind === 'interface' ? 'interfaz' : 'clase'} ${operation.title}${attributes}`;
   }
   if (operation?.op === 'project.create') return `Crear proyecto ${operation.payload?.name || ''}`;
+  if (/relation|relacion/i.test(operation?.op || operation?.type || '')) return relationPlanPreview(operation);
   return operation?.op || 'Cambio propuesto';
 }
 

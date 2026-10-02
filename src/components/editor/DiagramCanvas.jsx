@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { Component, useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import ReactFlow, { Background, ConnectionMode, Controls, MiniMap, useUpdateNodeInternals } from 'reactflow';
 import 'reactflow/dist/style.css';
@@ -17,9 +17,10 @@ import { actualizarRolMiembro, cancelarInvitacion, contenidoDiagrama, crearDiagr
 import { obtenerSesion } from '../../api/authApi';
 import { applyAiPlan, interpretAi } from '../../api/aiApi';
 import { useDiagramSocket } from '../../hooks/useDiagramSocket';
-import { isStaleRevisionPayload, normalizeVoiceTranscript, planNeedsConfirmation, voiceFinalAction, voiceRecognitionError } from '../../utils/aiFlow';
+import { interpretationClarificationMessage, isStaleRevisionPayload, normalizeVoiceTranscript, parseProjectCreationCommand, planNeedsConfirmation, voiceFinalAction, voiceRecognitionError, voiceSessionForPendingPlan } from '../../utils/aiFlow';
 import { DEFAULT_VOICE_PREFERENCES, selectBestSpanishVoice, speechSegments } from '../../utils/dianaVoice';
 import { isOwnSocketEvent, saveSnapshotIsCurrent, shouldReplaceRemoteDocument } from '../../utils/collaborationSync';
+import { appendXmiImportFormData, canStartXmiPreview, isValidXmiPreview, selectionFromMapping, toggleXmiCandidate, xmiCount, xmiImportErrorMessage, xmiList, xmiPreviewContractError, xmiText } from '../../utils/xmiImport';
 
 const nodeTypes = { umlClass: ClassNode };
 const edgeTypes = { relationEdge: RelationEdge };
@@ -175,7 +176,17 @@ export default function DiagramCanvas({ onLogout }) {
   const [relationAnchorPreview, setRelationAnchorPreview] = useState({});
   const [generating, setGenerating] = useState(false);
   const [xmiBusy, setXmiBusy] = useState(false);
+  // One state only: it belongs to this canvas and survives modal renders until
+  // the user cancels, replaces the file, or completes the final import.
   const [pendingXmiFile, setPendingXmiFile] = useState(null);
+  const [mappingMode, setMappingMode] = useState('class');
+  const [xmiPreview, setXmiPreview] = useState(null);
+  const [xmiPreviewError, setXmiPreviewError] = useState(null);
+  const [isXmiPreviewing, setIsXmiPreviewing] = useState(false);
+  const [isXmiImporting, setIsXmiImporting] = useState(false);
+  const [isXmiDialogOpen, setIsXmiDialogOpen] = useState(false);
+  const [xmiSelectedIds, setXmiSelectedIds] = useState([]);
+  const [xmiExcludedIds, setXmiExcludedIds] = useState([]);
   const [xmiReport, setXmiReport] = useState(null);
   const [importLayoutRefresh, setImportLayoutRefresh] = useState(0);
   const [generationErrors, setGenerationErrors] = useState([]);
@@ -212,6 +223,9 @@ export default function DiagramCanvas({ onLogout }) {
   const scheduleCurrentSaveRef = useRef(null);
   const reactFlowRef = useRef(null);
   const xmiInputRef = useRef(null);
+  const xmiImportAbortRef = useRef(null);
+  const xmiImportRequestRef = useRef(0);
+  const xmiPreviewingRef = useRef(false);
   const aiRequestRef = useRef(0);
   const aiAbortRef = useRef(null);
   const speechRecognitionRef = useRef(null);
@@ -226,6 +240,7 @@ export default function DiagramCanvas({ onLogout }) {
   const aiPlanRef = useRef(null);
   const aiStatusRef = useRef('inactivo');
   const voicePlanActionRef = useRef(false);
+  const localProjectApplyRef = useRef(false);
   const localSocketRequestIdsRef = useRef(new Map());
   const saveGenerationRef = useRef(0);
   const aiEchoRef = useRef(null);
@@ -491,6 +506,12 @@ export default function DiagramCanvas({ onLogout }) {
     }, diagramId, { recordHistory: true, markAiEcho: true });
   };
   const applyCurrentAiPlan = async (plan, confirm = true) => {
+    if (plan?.localProjectCreation) {
+      if (localProjectApplyRef.current || aiPlanRef.current !== plan) return;
+      localProjectApplyRef.current = true;
+      try { return await applyLocalProjectPlan(plan); }
+      finally { localProjectApplyRef.current = false; }
+    }
     const diagramId = activeDiagramRef.current;
     if (!plan?.plan_id || !diagramId) return;
     invalidatePendingSaves();
@@ -547,7 +568,37 @@ export default function DiagramCanvas({ onLogout }) {
   const interpretAiCommand = async (instruction, suppliedRequestId) => {
     const diagramId = activeDiagramRef.current;
     if (!instruction?.trim()) { setAiStatus('error'); setAiMessage('Escribe una instrucción antes de enviarla.'); return; }
-    if (!diagramId) { setAiStatus('error'); setAiMessage('Selecciona un diagrama guardado antes de usar el Agente IA.'); return; }
+    const projectRequest = parseProjectCreationCommand(instruction);
+    if (!diagramId) {
+      if (!projectRequest.isProjectCreation) {
+        setAiStatus('error');
+        setAiMessage('Selecciona un diagrama guardado antes de usar el Agente IA.');
+        return;
+      }
+      if (!projectRequest.name) {
+        setAiStatus('aclaracion');
+        setAiMessage('¿Qué nombre deseas para el proyecto?');
+        speakDiana('¿Qué nombre deseas para el proyecto?');
+        return;
+      }
+      const localPlan = {
+        localProjectCreation: true,
+        name: projectRequest.name,
+        summary: `Crear proyecto ${projectRequest.name}.`,
+        operations: [{ op: 'project.create', payload: { name: projectRequest.name, create_main_diagram: true } }],
+      };
+      aiPlanRef.current = localPlan;
+      setAiPlan(localPlan);
+      setAiStatus('confirmacion');
+      voiceSessionRef.current = 'confirmation';
+      setVoiceState('confirmation');
+      const message = `Perfecto. Preparé el proyecto ${projectRequest.name}. Di “confirmar” o pulsa Confirmar.`;
+      setAiMessage(message);
+      addAiHistory('usuario', instruction.trim());
+      addAiHistory('diana', message);
+      speakDiana(message, { resumeListening: true });
+      return;
+    }
     if (isReadOnly) { setAiStatus('error'); setAiMessage('No tienes permiso para modificar este diagrama.'); return; }
     clearTimeout(saveTimerRef.current);
     clearTimeout(socketSyncTimerRef.current);
@@ -576,8 +627,11 @@ export default function DiagramCanvas({ onLogout }) {
         return;
       }
       if (status === 'unsupported' || status === 'error') {
-        setAiStatus('error');
-        setAiMessage(data?.message || data?.detail || 'Esta instrucción no está soportada.');
+        const message = data?.question || 'No entendí completamente la instrucción. ¿Puedes decir qué clase, entidad, interfaz o relación deseas crear?';
+        setAiStatus('aclaracion');
+        setAiMessage(message);
+        addAiHistory('diana', message);
+        speakDiana(message);
         return;
       }
       const plan = data?.plan || data;
@@ -601,6 +655,16 @@ export default function DiagramCanvas({ onLogout }) {
       await applyCurrentAiPlan(normalizedPlan, true);
     } catch (requestError) {
       if (requestError.code === 'ERR_CANCELED' || !isCurrentAiRequest(requestId, diagramId)) return;
+      const clarification = interpretationClarificationMessage(requestError);
+      if (clarification) {
+        voiceSessionRef.current = 'idle';
+        setVoiceState('idle');
+        setAiStatus('aclaracion');
+        setAiMessage(clarification);
+        addAiHistory('diana', clarification);
+        speakDiana(clarification);
+        return;
+      }
       setAiStatus('error');
       setAiMessage(requestError.response?.data?.detail || requestError.response?.data?.message || requestError.message || 'No se pudo interpretar la instrucción.');
     } finally {
@@ -630,7 +694,9 @@ export default function DiagramCanvas({ onLogout }) {
     if (speechRecognitionRef.current) { stopVoiceRecognition(); setAiMessage('Reconocimiento de voz detenido.'); return; }
     voiceEnabledRef.current = true;
     setVoicePreferences((preferences) => ({ ...preferences, enabled: true }));
+    voiceSessionRef.current = voiceSessionForPendingPlan(voiceSessionRef.current, Boolean(aiPlanRef.current));
     voiceSessionRef.current = ['instruction', 'confirmation'].includes(voiceSessionRef.current) ? voiceSessionRef.current : 'wake';
+    speechTranscriptRef.current = '';
     if (!ActiveRecognition) { setAiStatus('error'); setAiMessage('Este navegador no admite reconocimiento de voz. Puedes escribir la instrucción.'); return; }
     const recognition = new ActiveRecognition();
     recognition.lang = import.meta.env.VITE_SPEECH_LANGUAGE || 'es-ES';
@@ -746,6 +812,8 @@ export default function DiagramCanvas({ onLogout }) {
     aiRequestRef.current += 1;
     aiAbortRef.current?.abort();
     saveAbortRef.current?.abort();
+    xmiImportAbortRef.current?.abort();
+    xmiImportAbortRef.current = null;
     clearTimeout(saveTimerRef.current);
     clearTimeout(socketSyncTimerRef.current);
     speechRecognitionRef.current?.abort();
@@ -838,13 +906,13 @@ export default function DiagramCanvas({ onLogout }) {
     };
   }, []);
 
-  const openProject = useCallback(async (project, closeDialog = true, forceEmpty = false) => {
+  const openProject = useCallback(async (project, closeDialog = true, forceEmpty = false, preloadedDiagram = null) => {
     try {
       clearTimeout(saveTimerRef.current);
       await persistPendingChanges();
       diagramLoadedRef.current = false;
       setNodeMenu(null);
-      const diagram = forceEmpty ? null : await obtenerDiagramaPrincipal(project);
+      const diagram = forceEmpty ? null : preloadedDiagram || await obtenerDiagramaPrincipal(project);
       const migrated = restore(diagram ? contenidoDiagrama(diagram) : { nodes: [], edges: [] });
       const restored = useDiagramStore.getState();
       diagramStateRef.current = { nodes: restored.nodes, edges: restored.edges };
@@ -1053,35 +1121,169 @@ export default function DiagramCanvas({ onLogout }) {
   };
   const uploadXmi = async (event) => {
     const file = event.target.files?.[0]; event.target.value = '';
-    if (!file || !activeDiagramId || xmiBusy) return;
+    if (!file || !activeDiagramId || xmiBusy || isXmiImporting) return;
+    xmiImportRequestRef.current += 1;
+    xmiImportAbortRef.current?.abort();
+    xmiPreviewingRef.current = false;
+    setIsXmiDialogOpen(true);
+    setXmiPreview(null);
+    setXmiPreviewError(null);
+    setXmiSelectedIds([]);
+    setXmiExcludedIds([]);
+    setMappingMode('class');
+    if (!/\.(xmi|xml)$/i.test(file.name || '')) {
+      setPendingXmiFile(null);
+      setXmiPreviewError('Selecciona un archivo XMI válido.');
+      return;
+    }
     setPendingXmiFile(file);
+  };
+  const closeXmiImport = () => {
+    xmiImportRequestRef.current += 1;
+    xmiImportAbortRef.current?.abort();
+    xmiImportAbortRef.current = null;
+    xmiPreviewingRef.current = false;
+    setPendingXmiFile(null);
+    setMappingMode('class');
+    setXmiPreview(null);
+    setXmiPreviewError(null);
+    setXmiSelectedIds([]);
+    setXmiExcludedIds([]);
+    setIsXmiPreviewing(false);
+    setIsXmiDialogOpen(false);
+  };
+  const handleGenerateXmiPreview = async () => {
+    console.debug('XMI preview clicked', {
+      hasFile: pendingXmiFile instanceof File,
+      fileName: pendingXmiFile?.name ?? null,
+      mappingMode,
+    });
+    // A new explicit attempt never inherits a message from a prior file/mode.
+    setXmiPreviewError(null);
+    const file = pendingXmiFile;
+    const diagramId = activeDiagramRef.current;
+    if (!(file instanceof File)) {
+      setXmiPreviewError('Selecciona un archivo XMI válido.');
+      return;
+    }
+    if (!diagramId || !canStartXmiPreview(file, isXmiPreviewing, xmiPreviewingRef.current)) return;
+    const request = ++xmiImportRequestRef.current;
+    xmiImportAbortRef.current?.abort();
+    const controller = new AbortController();
+    xmiImportAbortRef.current = controller;
+    xmiPreviewingRef.current = true;
+    setIsXmiPreviewing(true);
+    setXmiPreview(null);
+    setXmiPreviewError(null);
+    setXmiSelectedIds([]);
+    setXmiExcludedIds([]);
+    try {
+      const formData = appendXmiImportFormData(new FormData(), { file, mappingMode, dryRun: true });
+      console.debug('XMI FormData', [...formData.entries()].map(([key, value]) => [
+        key,
+        value instanceof File ? `${value.name} (${value.size} bytes)` : value,
+      ]));
+      console.debug('XMI request starting');
+      const result = await importarXmi(diagramId, formData, { signal: controller.signal });
+      if (request !== xmiImportRequestRef.current || String(diagramId) !== String(activeDiagramRef.current)) return;
+      console.debug('XMI response received', { dryRun: result?.dry_run, keys: Object.keys(result ?? {}) });
+      console.debug('XMI dry-run response shape', {
+        dryRun: result?.dry_run,
+        hasReport: Boolean(result?.report),
+        hasMapping: Boolean(result?.report?.mapping),
+        hasPreview: Boolean(result?.preview),
+        keys: Object.keys(result || {}),
+      });
+      if (!isValidXmiPreview(result)) {
+        setXmiPreviewError(xmiPreviewContractError(result));
+        return;
+      }
+      const mapping = result.report.mapping;
+      setXmiPreview(result);
+      const selection = selectionFromMapping(mapping);
+      setXmiSelectedIds(selection.selectedIds);
+      setXmiExcludedIds(selection.excludedIds);
+    } catch (requestError) {
+      console.debug('XMI request failed', { message: requestError?.message, code: requestError?.code, status: requestError?.response?.status });
+      if (requestError.code === 'ERR_CANCELED' || request !== xmiImportRequestRef.current) return;
+      setXmiPreview(null);
+      setXmiPreviewError('No se pudo contactar al servidor para generar la previsualización.');
+    } finally {
+      if (xmiImportAbortRef.current === controller) xmiImportAbortRef.current = null;
+      if (request === xmiImportRequestRef.current) {
+        xmiPreviewingRef.current = false;
+        setIsXmiPreviewing(false);
+      }
+    }
+  };
+  const changeXmiMappingMode = (nextMappingMode) => {
+    if (isXmiImporting) return;
+    xmiImportRequestRef.current += 1;
+    xmiImportAbortRef.current?.abort();
+    xmiPreviewingRef.current = false;
+    setMappingMode(nextMappingMode);
+    setXmiPreview(null);
+    setXmiPreviewError(null);
+    setXmiSelectedIds([]);
+    setXmiExcludedIds([]);
+    setIsXmiPreviewing(false);
+  };
+  const toggleXmiSelection = (candidate, checked) => {
+    const next = toggleXmiCandidate({ selectedIds: xmiSelectedIds, excludedIds: xmiExcludedIds }, candidate, checked);
+    setXmiSelectedIds(next.selectedIds);
+    setXmiExcludedIds(next.excludedIds);
   };
   const confirmXmiImport = async () => {
     const file = pendingXmiFile;
-    if (!file || !activeDiagramId || xmiBusy) return;
+    if (!file || !activeDiagramId || xmiBusy || isXmiPreviewing || isXmiImporting || !isValidXmiPreview(xmiPreview)) return;
+    const diagramId = activeDiagramRef.current;
+    const request = ++xmiImportRequestRef.current;
+    xmiImportAbortRef.current?.abort();
+    const controller = new AbortController();
+    xmiImportAbortRef.current = controller;
+    setIsXmiImporting(true);
+    setXmiPreviewError(null);
     setXmiBusy(true);
     try {
-      const { data } = await importarXmi(activeDiagramId, file);
-      restore({ nodes: data.nodes || [], edges: data.edges || [] });
-      const restored = useDiagramStore.getState(); diagramStateRef.current = { nodes: restored.nodes, edges: restored.edges }; hasPendingChangesRef.current = false;
+      const formData = appendXmiImportFormData(new FormData(), { file,
+        mappingMode,
+        dryRun: false,
+        selectedIds: xmiSelectedIds,
+        excludedIds: xmiExcludedIds,
+      });
+      console.debug('XMI FormData', [...formData.entries()].map(([key, value]) => [
+        key,
+        value instanceof File ? `${value.name} (${value.size} bytes)` : value,
+      ]));
+      const data = await importarXmi(diagramId, formData, { signal: controller.signal });
+      if (request !== xmiImportRequestRef.current || String(diagramId) !== String(activeDiagramRef.current)) return;
+      const finalPayload = data?.diagram || data;
+      const document = { ...finalPayload, ...contenidoDiagrama(finalPayload), revision: finalPayload?.revision ?? data?.revision };
+      if (!replaceWithAuthoritativeDocument(document, diagramId, { recordHistory: true })) throw new Error('El servidor no devolvió el diagrama autoritativo.');
       setImportLayoutRefresh((current) => current + 1);
       // React Flow calculates class-card dimensions and connection handles
       // asynchronously.  The store already assigned imported connectors to
       // their nearest sides from the UMLDI geometry; wait before fitting the
       // camera so the first visible frame uses those handles.
       await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => window.setTimeout(resolve, 80))));
-      scheduleCurrentSave();
-      await new Promise((resolve) => window.setTimeout(resolve, 180));
       reactFlowRef.current?.fitView({ padding: 0.2, duration: 180 });
       const report = data.report || {};
       setXmiReport(report);
       const umlNonPersistent = report.umlNonPersistentRelations || 0;
       setToast(`XMI importado: ${report.imported?.nodes || 0} nodos, ${report.imported?.edges || 0} relaciones${umlNonPersistent ? ` (${umlNonPersistent} UML no persistentes)` : ''}.`);
+      setIsXmiDialogOpen(false);
+      setPendingXmiFile(null);
     } catch (requestError) {
+      if (requestError.code === 'ERR_CANCELED' || request !== xmiImportRequestRef.current) return;
       const issues = generationIssues(requestError.response?.data, 'No se pudo importar el XMI.');
       setXmiReport({ error: true, errors: issues });
       focusGenerationIssue(issues[0]);
-    } finally { setPendingXmiFile(null); setXmiBusy(false); }
+      setXmiPreviewError(xmiImportErrorMessage(requestError));
+    } finally {
+      if (xmiImportAbortRef.current === controller) xmiImportAbortRef.current = null;
+      setXmiBusy(false);
+      if (request === xmiImportRequestRef.current) setIsXmiImporting(false);
+    }
   };
   const requestDeleteNode = useCallback((id) => { setNodeMenu(null); setDeleteCandidate(nodes.find((node) => node.id === id) || null); }, [nodes]);
   const openNodeMenu = useCallback((id, x, y) => {
@@ -1123,6 +1325,44 @@ export default function DiagramCanvas({ onLogout }) {
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [canUseRelations, selectedNodeId, nodes, undo, redo]);
   const createProject = () => { setProjectName(''); setProjectNameError(''); setNewProjectOpen(true); };
+  async function applyLocalProjectPlan(plan) {
+    const name = String(plan?.name || '').trim();
+    if (!name) return;
+    if (projects.some((project) => (project.nombre || project.name || '').trim().toLocaleLowerCase() === name.toLocaleLowerCase())) {
+      aiPlanRef.current = null;
+      setAiPlan(null);
+      voiceSessionRef.current = 'idle';
+      setVoiceState('idle');
+      setAiStatus('error');
+      setAiMessage('Ya tienes un proyecto activo con ese nombre.');
+      return;
+    }
+    setAiStatus('aplicando');
+    setAiMessage('Creando el proyecto…');
+    try {
+      const project = await crearProyecto(name);
+      setProjects((current) => [project, ...current.filter((item) => String(item.id) !== String(project.id))]);
+      const principalDiagram = await obtenerDiagramaPrincipal(project);
+      await openProject(project, true, false, principalDiagram);
+      aiPlanRef.current = null;
+      setAiPlan(null);
+      voiceSessionRef.current = 'idle';
+      setVoiceState('idle');
+      const message = `Proyecto ${project.nombre || project.name || name} creado.`;
+      setAiStatus('exito');
+      setAiMessage(message);
+      addAiHistory('diana', message);
+      speakDiana(message);
+      setToast(message);
+    } catch (requestError) {
+      aiPlanRef.current = null;
+      setAiPlan(null);
+      voiceSessionRef.current = 'idle';
+      setVoiceState('idle');
+      setAiStatus('error');
+      setAiMessage(requestError.response?.data?.detail || 'No se pudo crear el proyecto.');
+    }
+  }
   const leaveProject = async () => { clearTimeout(saveTimerRef.current); await persistPendingChanges(); if (activeDiagramRef.current) socketSendRef.current?.({ type: 'presence.leave', diagram_id: activeDiagramRef.current }); window.sessionStorage.removeItem('diagramcraft-active-project'); diagramLoadedRef.current = false; activeProjectRef.current = null; activeDiagramRef.current = null; hasPendingChangesRef.current = false; setActiveProjectId(null); setActiveDiagramId(null); setOnlineMembers([]); setNodeMenu(null); setSaveStatus('local'); if (restore(loadPrincipalDraft())) scheduleCurrentSave(); setProjectsOpen(false); setToast('Volviste al lienzo principal.'); };
   const confirmCreateProject = async () => {
     const normalizedName = projectName.trim();
@@ -1303,8 +1543,8 @@ export default function DiagramCanvas({ onLogout }) {
     </div>
     {toast && <div className="fixed bottom-5 left-1/2 z-50 -translate-x-1/2 rounded bg-[#18264a] px-4 py-3">{toast}</div>}
     {generationErrors.length > 0 && <GenerationErrorDialog errors={generationErrors} onClose={() => { setGenerationErrors([]); setHighlightedEdgeId(null); }} onFocus={(issue) => { focusGenerationIssue(issue); setGenerationErrors([]); }} />}
-    {pendingXmiFile && <XmiImportConfirmation file={pendingXmiFile} busy={xmiBusy} onClose={() => !xmiBusy && setPendingXmiFile(null)} onConfirm={confirmXmiImport} />}
-    {xmiReport && <XmiReportDialog report={xmiReport} onClose={() => setXmiReport(null)} onFocus={focusGenerationIssue} />}
+    {isXmiDialogOpen && <XmiImportDialogBoundary onClose={closeXmiImport} onRetry={handleGenerateXmiPreview}><XmiImportConfirmation file={pendingXmiFile} mappingMode={mappingMode} preview={xmiPreview} previewError={xmiPreviewError} isPreviewing={isXmiPreviewing} isImporting={isXmiImporting} selectedIds={xmiSelectedIds} excludedIds={xmiExcludedIds} busy={xmiBusy} onClose={closeXmiImport} onConfirm={confirmXmiImport} onPreview={handleGenerateXmiPreview} onMappingMode={changeXmiMappingMode} onToggleCandidate={toggleXmiSelection} /></XmiImportDialogBoundary>}
+    {xmiReport && <SafeXmiReportDialog report={xmiReport} onClose={() => setXmiReport(null)} onFocus={focusGenerationIssue} />}
     {projectsOpen && <ProjectsDialog projects={projects} activeId={activeProjectId} currentUserId={currentUser?.id} onClose={() => setProjectsOpen(false)} onNew={createProject} onOpen={openProject} onLeaveProject={leaveProject} onLeaveCollaboration={leaveCollaboration} onRefresh={() => listarProyectos().then(setProjects)} />}
     {newProjectOpen && <NewProjectDialog name={projectName} setName={(name) => { setProjectName(name); setProjectNameError(''); }} error={projectNameError} onClose={() => setNewProjectOpen(false)} onCreate={confirmCreateProject} />}
     {shareOpen && <CollaboratorsDialog project={activeProject} email={invite} setEmail={setInvite} onlineMembers={onlineMembers} acceptedMember={acceptedInvitationMember} onDismissAccepted={() => setAcceptedInvitationMember(null)} onClose={() => setShareOpen(false)} onInvite={sendInvite} onResendInvite={resendInvite} onCancelInvite={cancelInvite} onChangeRole={changeMemberRole} onRemove={removeMember} onViewCanvas={() => activeProject && openProject(activeProject)} currentUserId={currentUser?.id} canInvite={isOwner} canManage={isOwner} />}
@@ -1324,7 +1564,85 @@ function GenerationErrorDialog({ errors, onClose, onFocus }) {
   useEscapeClose(true, onClose);
   return <div className="fixed inset-0 z-[10001] grid place-items-center bg-slate-950/60 p-5" onMouseDown={onClose}><section role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()} className="max-h-[80vh] w-full max-w-xl overflow-y-auto rounded-2xl border border-rose-400/50 bg-[#101a31] p-5 shadow-2xl"><header className="flex items-start justify-between gap-4"><div><h2 className="text-lg font-extrabold text-rose-200">No se pudo generar el proyecto</h2><p className="mt-1 text-sm text-slate-400">Corrige los elementos indicados y vuelve a intentarlo.</p></div><button onClick={onClose} className="rounded p-1 text-slate-400 hover:bg-slate-700 hover:text-white">×</button></header><ul className="mt-4 space-y-2">{errors.map((issue, index) => { const canFocus = Boolean(issue.node_id || issue.edge_id || issue.element_id); return <li key={`${issue.message}-${index}`} role={canFocus ? 'button' : undefined} tabIndex={canFocus ? 0 : undefined} onClick={() => canFocus && onFocus(issue)} onKeyDown={(event) => { if (canFocus && (event.key === 'Enter' || event.key === ' ')) { event.preventDefault(); onFocus(issue); } }} className={`rounded-lg border border-slate-700 bg-[#091124] p-3 ${canFocus ? 'cursor-pointer hover:border-cyan-400/70 hover:bg-cyan-400/5' : ''}`}><p className="text-sm text-slate-100">{issue.message}</p>{issue.field && <small className="mt-1 block font-mono text-slate-400">{issue.field}</small>}{canFocus && <small className="mt-2 block text-xs font-bold text-cyan-300">Clic para ver el elemento en el diagrama</small>}</li>; })}</ul><button onClick={onClose} className="mt-5 w-full rounded-lg border border-slate-600 py-2 font-bold text-slate-200 hover:bg-slate-700">Cerrar</button></section></div>;
 }
-function XmiImportConfirmation({ file, busy, onClose, onConfirm }) { useEscapeClose(Boolean(file) && !busy, onClose); return <div role="dialog" aria-modal="true" className="fixed inset-0 z-[90] grid place-items-center bg-black/70 p-4"><section className="w-full max-w-md rounded-2xl border border-cyan-400/40 bg-[#101a31] p-5 shadow-2xl"><h2 className="text-lg font-bold text-white">Importar XMI (EA)</h2><p className="mt-3 text-sm text-slate-300"><b>{file.name}</b> · {(file.size / 1024).toFixed(1)} KB</p><p className="mt-3 text-sm text-amber-200">El modo reemplazar sustituirá el diagrama actual una vez que el archivo sea validado.</p><div className="mt-6 flex justify-end gap-3"><button disabled={busy} onClick={onClose} className="rounded-lg border border-slate-600 px-4 py-2 disabled:opacity-40">Cancelar</button><button disabled={busy} onClick={onConfirm} className="rounded-lg bg-cyan-600 px-4 py-2 font-bold text-white disabled:opacity-40">{busy ? 'Importando…' : 'Reemplazar e importar'}</button></div></section></div>; }
+class XmiImportDialogBoundary extends Component {
+  constructor(props) { super(props); this.state = { failed: false }; }
+  static getDerivedStateFromError() { return { failed: true }; }
+  retry = () => { this.setState({ failed: false }); this.props.onRetry?.(); };
+  render() {
+    if (!this.state.failed) return this.props.children;
+    return <div role="dialog" aria-modal="true" className="fixed inset-0 z-[90] grid place-items-center bg-black/70 p-4"><section className="w-full max-w-md rounded-2xl border border-rose-400/40 bg-[#101a31] p-5 shadow-2xl"><h2 className="text-lg font-bold text-white">No se pudo mostrar la importación XMI</h2><p className="mt-2 text-sm text-slate-300">El editor continúa seguro. Puedes reintentar la previsualización o cerrar este diálogo.</p><div className="mt-5 flex justify-end gap-3"><button onClick={this.props.onClose} className="rounded border border-slate-600 px-3 py-2">Cerrar</button><button onClick={this.retry} className="rounded bg-cyan-600 px-3 py-2 font-bold text-white">Reintentar</button></div></section></div>;
+  }
+}
+
+function SafeXmiReportDialog({ report: inputReport, onClose, onFocus }) {
+  const source = inputReport && typeof inputReport === 'object' ? inputReport : {};
+  const normalizeIssue = (issue) => ({
+    ...(issue && typeof issue === 'object' ? issue : {}),
+    message: xmiText(issue, 'No se pudo procesar el XMI.'),
+  });
+  const report = {
+    ...source,
+    dialect: xmiText(source.dialect, 'No especificado'),
+    xmi_version: xmiText(source.xmi_version, 'No especificada'),
+    exporter: xmiText(source.exporter, 'Desconocido'),
+    imported: { nodes: xmiCount(source.imported?.nodes), edges: xmiCount(source.imported?.edges) },
+    errors: xmiList(source.errors).map(normalizeIssue),
+    warnings: xmiList(source.warnings).map((warning) => xmiText(warning, 'Advertencia de importación XMI.')).filter(Boolean),
+  };
+  return <XmiReportDialog report={report} onClose={onClose} onFocus={onFocus} />;
+}
+
+function XmiImportConfirmation({ file: inputFile, mappingMode, preview: suppliedPreview, previewError, isPreviewing, isImporting, selectedIds, excludedIds, busy, onClose, onConfirm, onPreview, onMappingMode, onToggleCandidate, onRetry = onPreview }) {
+  useEscapeClose(!busy, onClose);
+  const file = inputFile || { name: 'Sin archivo seleccionado', size: 0 };
+  const state = { phase: isImporting ? 'importing' : isPreviewing ? 'previewing' : suppliedPreview ? 'previewReady' : previewError ? 'error' : 'idle', mappingMode, preview: suppliedPreview, selectedIds, excludedIds, error: previewError };
+  const rawPreview = suppliedPreview && typeof suppliedPreview === 'object' ? suppliedPreview : null;
+  const report = rawPreview?.report && typeof rawPreview.report === 'object' ? rawPreview.report : {};
+  const rawMapping = report.mapping && typeof report.mapping === 'object' ? report.mapping : {};
+  // The API may return an array of nodes/edges in its preview. JSX must show
+  // the count, never the raw objects ({ id, type, position, data, attrs }).
+  const preview = rawPreview ? {
+    ...rawPreview,
+    nodes: xmiCount(rawPreview.nodes ?? report.imported?.nodes),
+    edges: xmiCount(rawPreview.edges ?? report.imported?.edges),
+  } : null;
+  const mapping = {
+    ...rawMapping,
+    candidates: xmiList(rawMapping.candidates),
+    entities: xmiList(rawMapping.entities),
+    classes: xmiList(rawMapping.classes),
+    excluded: xmiList(rawMapping.excluded),
+    warnings: xmiList(rawMapping.warnings),
+  };
+  const entityIds = new Set(xmiList(mapping.entities).map((item) => String(item?.xmi_id || item?.xmiId || item?.id || '')));
+  const excluded = xmiList(mapping.excluded);
+  const candidates = xmiList(mapping.candidates).map((candidate) => {
+    const sourceCandidate = candidate && typeof candidate === 'object' ? candidate : {};
+    const xmiId = String(sourceCandidate.xmi_id || sourceCandidate.xmiId || sourceCandidate.id || '');
+    const excludedInfo = excluded.find((item) => String(item?.xmi_id || item?.xmiId || item?.id || '') === xmiId);
+    return {
+      ...sourceCandidate,
+      xmi_id: xmiId,
+      name: xmiText(sourceCandidate.name, xmiId),
+      evidence: xmiList(sourceCandidate.evidence).map((item) => xmiText(item)).filter(Boolean),
+      default_entity: entityIds.has(xmiId),
+      technical: Boolean(sourceCandidate.technical || excludedInfo?.reason === 'technical_table'),
+    };
+  });
+  const classes = xmiList(mapping.classes);
+  const warnings = [...xmiList(report.warnings), ...xmiList(mapping.warnings)]
+    .map((warning) => xmiText(warning, 'Advertencia de importación XMI.'))
+    .filter(Boolean);
+  const phaseLabel = state.phase === 'previewing' ? 'Analizando XMI…' : state.phase === 'importing' ? 'Importando…' : '';
+  const canImport = state.phase === 'previewReady' && !busy;
+  const modes = [
+    ['class', 'Clases Java UML', 'Conserva el XMI como diseño UML. Genera código Java normal; no crea persistencia JPA.'],
+    ['entity', 'Entidades JPA para tablas de negocio', 'El backend propone clases elegibles con identificador confiable. Puedes desmarcar las que deben seguir como Class Java.'],
+    ['auto', 'Detectar automáticamente', 'El backend usa PK/id, FK, asociaciones o metadatos XMI. Si hay duda, conserva Class Java.'],
+  ];
+  if (!preview) return <div role="dialog" aria-modal="true" className="fixed inset-0 z-[90] grid place-items-center bg-black/70 p-4"><section className="w-full max-w-xl rounded-2xl border border-cyan-400/40 bg-[#101a31] p-5 shadow-2xl"><header className="flex items-start justify-between gap-3"><div><h2 className="text-lg font-bold text-white">Importar XMI (EA)</h2><p className="mt-1 text-sm text-slate-300">{inputFile ? `${file.name} · ${(file.size / 1024).toFixed(1)} KB` : 'Selecciona un archivo XMI o XML.'}</p></div><button type="button" disabled={busy || isImporting} onClick={onClose} className="rounded border border-slate-600 px-2 py-1 disabled:opacity-40">×</button></header><fieldset disabled={isPreviewing || isImporting || !inputFile} className="mt-5"><legend className="mb-2 font-semibold text-white">Importar clases como:</legend>{modes.map(([value, title, copy]) => <label key={value} className="mb-2 flex cursor-pointer gap-3 rounded-lg border border-slate-700 bg-[#091124] p-3"><input type="radio" name="xmi-mapping-mode" checked={mappingMode === value} onChange={() => onMappingMode(value)} /><span><b className="block text-sm text-slate-100">{title}</b><span className="mt-1 block text-xs text-slate-400">{copy}</span></span></label>)}</fieldset>{isPreviewing && <p className="mt-4 rounded border border-cyan-400/30 bg-cyan-950/30 p-3 text-sm text-cyan-100">Analizando XMI…</p>}{previewError && <p className="mt-4 rounded border border-rose-400/30 bg-rose-950/30 p-3 text-sm text-rose-100">{previewError}</p>}{!inputFile && !previewError && <p className="mt-4 text-sm text-slate-400">Selecciona un archivo y genera la previsualización.</p>}<div className="mt-6 flex justify-end gap-3"><button type="button" disabled={busy || isImporting} onClick={onClose} className="rounded-lg border border-slate-600 px-4 py-2 disabled:opacity-40">Cancelar</button><button type="button" disabled={isPreviewing || isImporting} onClick={onPreview} className="rounded-lg bg-cyan-600 px-4 py-2 font-bold text-white disabled:opacity-40">{isPreviewing ? 'Analizando…' : 'Generar previsualización'}</button></div></section></div>;
+  return <div role="dialog" aria-modal="true" className="fixed inset-0 z-[90] grid place-items-center bg-black/70 p-4"><section className="max-h-[90vh] w-full max-w-2xl overflow-y-auto rounded-2xl border border-cyan-400/40 bg-[#101a31] p-5 shadow-2xl"><header className="flex items-start justify-between gap-3"><div><h2 className="text-lg font-bold text-white">Importar XMI (EA)</h2><p className="mt-1 text-sm text-slate-300"><b>{file.name}</b> · {(file.size / 1024).toFixed(1)} KB</p></div><button disabled={busy} onClick={onClose} className="rounded border border-slate-600 px-2 py-1 disabled:opacity-40">×</button></header><fieldset disabled={['previewing', 'importing'].includes(state.phase)} className="mt-5"><legend className="mb-2 font-semibold text-white">Importar clases como:</legend><div className="space-y-2">{modes.map(([value, title, copy]) => <label key={value} className="flex cursor-pointer gap-3 rounded-lg border border-slate-700 bg-[#091124] p-3"><input type="radio" name="xmi-mapping-mode" value={value} checked={state.mappingMode === value} onChange={() => onMappingMode(value)} /><span><b className="block text-sm text-slate-100">{title}</b><span className="mt-1 block text-xs text-slate-400">{copy}</span></span></label>)}</div></fieldset>{phaseLabel && <p className="mt-4 rounded border border-cyan-400/30 bg-cyan-950/30 p-3 text-sm text-cyan-100">{phaseLabel}</p>}{state.error && <div className="mt-4 rounded border border-rose-400/30 bg-rose-950/30 p-3 text-sm text-rose-100"><p>{state.error}</p><button onClick={onRetry} className="mt-2 rounded border border-rose-300/40 px-2 py-1 text-xs">Reintentar análisis</button></div>}{state.phase === 'previewReady' && <><section className="mt-5 rounded-lg border border-slate-700 bg-[#091124] p-3"><h3 className="font-semibold text-white">Previsualización del backend</h3><dl className="mt-3 grid grid-cols-2 gap-2 text-xs"><div><dt className="text-slate-400">Nodos detectados</dt><dd>{preview.nodes ?? report.imported?.nodes ?? 0}</dd></div><div><dt className="text-slate-400">Relaciones detectadas</dt><dd>{preview.edges ?? report.imported?.edges ?? 0}</dd></div><div><dt className="text-slate-400">Entity propuestas</dt><dd>{(mapping.entities || []).length}</dd></div><div><dt className="text-slate-400">Class Java</dt><dd>{classes.length}</dd></div><div><dt className="text-slate-400">Interfaces</dt><dd>{classes.filter((item) => item?.kind === 'interface').length}</dd></div><div><dt className="text-slate-400">Relaciones JPA propuestas</dt><dd>No disponible en la previsualización.</dd></div></dl>{(report.dialect || report.xmi_version || report.exporter) && <p className="mt-3 text-xs text-slate-400">{[report.dialect, report.xmi_version, report.exporter].filter(Boolean).join(' · ')}</p>}</section>{candidates.length > 0 && <section className="mt-4"><h3 className="font-semibold text-white">Candidatos a Entity</h3><div className="mt-2 space-y-2">{candidates.map((candidate) => { const checked = state.selectedIds.includes(candidate.xmi_id); const disabled = candidate.kind === 'interface' || !candidate.has_identifier || candidate.technical; return <label key={candidate.xmi_id} className={`block rounded-lg border p-3 ${disabled ? 'border-slate-800 bg-slate-900/50 opacity-75' : 'border-slate-700 bg-[#091124]'}`}><div className="flex gap-3"><input type="checkbox" checked={checked} disabled={disabled} onChange={(event) => onToggleCandidate(candidate, event.target.checked)} /><span className="min-w-0"><b className="block text-sm text-slate-100">{candidate.name || candidate.xmi_id}</b><span className="block font-mono text-[10px] text-slate-500">{candidate.xmi_id}</span>{candidate.technical ? <span className="mt-1 block text-xs text-amber-200">Tabla técnica de Django: no se recomienda convertir automáticamente.</span> : candidate.kind === 'interface' ? <span className="mt-1 block text-xs text-slate-400">Las interfaces no pueden convertirse en Entity.</span> : !candidate.has_identifier ? <span className="mt-1 block text-xs text-slate-400">Sin identificador confiable: se mantiene como Class Java.</span> : <span className="mt-1 block text-xs text-cyan-100">{checked ? 'Se generará @Entity y podrá crear tabla, repositorio, servicio y controlador.' : 'Se generará código Java normal; no crea tabla ni persistencia JPA.'}</span>}{candidate.evidence?.length > 0 && <span className="mt-1 block text-xs text-slate-400">Evidencia: {candidate.evidence.join(', ')}</span>}</span></div></label>; })}</div></section>}{excluded.filter((item) => item?.reason === 'technical_table').length > 0 && <p className="mt-3 text-xs text-amber-200">Se excluyeron tablas técnicas de Django.</p>}{warnings.length > 0 && <ul className="mt-4 space-y-1 rounded border border-amber-400/25 bg-amber-950/20 p-3 text-xs text-amber-100">{warnings.map((warning, index) => <li key={index}>{typeof warning === 'string' ? warning : warning.message}</li>)}</ul>}</>}<p className="mt-5 text-sm text-amber-200">El modo reemplazar sustituirá el diagrama actual solo después de confirmar esta importación.</p><div className="mt-6 flex justify-end gap-3"><button disabled={busy || state.phase === 'importing'} onClick={onClose} className="rounded-lg border border-slate-600 px-4 py-2 disabled:opacity-40">Cancelar</button><button disabled={!canImport} onClick={onConfirm} className="rounded-lg bg-cyan-600 px-4 py-2 font-bold text-white disabled:opacity-40">{state.phase === 'importing' ? 'Importando…' : 'Importar definitivamente'}</button></div></section></div>;
+}
 function XmiReportDialog({ report, onClose, onFocus }) { useEscapeClose(Boolean(report), onClose); const errors = report.errors || []; const warnings = report.warnings || []; return <div role="dialog" aria-modal="true" className="fixed inset-0 z-[90] grid place-items-center bg-black/70 p-4"><section className="w-full max-w-lg rounded-2xl border border-cyan-400/40 bg-[#101a31] p-5 shadow-2xl"><div className="flex items-center justify-between"><h2 className="text-lg font-bold text-white">{report.error ? 'No se pudo procesar el XMI' : 'Reporte de compatibilidad XMI'}</h2><button onClick={onClose}><FiX /></button></div>{report.error ? <ul className="mt-4 space-y-2 text-sm text-rose-200">{errors.map((issue, index) => <li key={`${issue.message}-${index}`} className="rounded border border-rose-400/30 p-2"><div>{issue.message}</div>{(issue.node_id || issue.edge_id || issue.element_id) && <button onClick={() => onFocus(issue)} className="mt-1 text-cyan-300 underline">Ver elemento en el diagrama</button>}</li>)}</ul> : <><dl className="mt-4 grid grid-cols-2 gap-2 text-sm"><div><dt className="text-slate-400">Dialecto</dt><dd>{report.dialect || 'No especificado'}</dd></div><div><dt className="text-slate-400">Versión</dt><dd>{report.xmi_version || 'No especificada'}</dd></div><div><dt className="text-slate-400">Exporter</dt><dd>{report.exporter || 'Desconocido'}</dd></div><div><dt className="text-slate-400">Importados</dt><dd>{report.imported?.nodes || 0} nodos, {report.imported?.edges || 0} relaciones</dd></div></dl>{warnings.length > 0 && <ul className="mt-4 space-y-1 text-sm text-amber-200">{warnings.map((warning, index) => <li key={index}>{typeof warning === 'string' ? warning : warning.message}</li>)}</ul>}</>}<div className="mt-5 flex justify-end"><button onClick={onClose} className="rounded-lg border border-slate-600 px-4 py-2">Cerrar</button></div></section></div>; }
 function NodeContextMenu({ node, position, onClose, onEdit, onDuplicate, onToggleLock, onDelete }) { useEscapeClose(Boolean(node), onClose); if (!node) return null; return <div className="fixed inset-0 z-[10000]" onMouseDown={onClose}><section role="menu" onMouseDown={(event) => event.stopPropagation()} style={{ left: Math.min(position.x, window.innerWidth - 300), top: Math.min(position.y, window.innerHeight - 280) }} className="fixed w-72 rounded-2xl border border-slate-500/45 bg-[#2a344f] p-3 text-slate-100 shadow-2xl"><div className="mb-2 flex justify-between px-2 text-[10px] font-bold uppercase tracking-wide text-slate-300"><span>Acciones de clase</span><span>Proyecto</span></div><button onClick={onEdit} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left font-bold hover:bg-slate-600/50"><FiEdit3 className="text-violet-200" />Editar campos y métodos</button><button onClick={onDuplicate} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left font-bold hover:bg-slate-600/50"><FiCopy className="text-violet-200" />Duplicar nodo</button><button onClick={onToggleLock} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left font-bold hover:bg-slate-600/50">{node.data.positionLocked ? <FiUnlock className="text-cyan-200" /> : <FiLock className="text-cyan-200" />}{node.data.positionLocked ? 'Desbloquear posición' : 'Bloquear posición'}</button><div className="mt-2 rounded-xl bg-rose-950/45 p-1"><button onClick={onDelete} className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left font-bold text-rose-200 hover:bg-rose-900/40"><FiTrash2 />Eliminar clase del diagrama</button></div></section></div>; }
 function RelationContextMenu({ position, onClose, onDelete }) { useEscapeClose(true, onClose); return <div className="fixed inset-0 z-[10000]" onMouseDown={onClose}><section role="menu" onMouseDown={(event) => event.stopPropagation()} style={{ left: Math.min(position.x, window.innerWidth - 240), top: Math.min(position.y, window.innerHeight - 100) }} className="fixed w-56 rounded-xl border border-slate-500/45 bg-[#2a344f] p-2 shadow-2xl"><button onClick={onDelete} className="flex w-full items-center gap-3 rounded-lg px-3 py-3 text-left text-sm font-bold text-rose-200 hover:bg-rose-900/40"><FiTrash2 />Eliminar relación</button></section></div>; }

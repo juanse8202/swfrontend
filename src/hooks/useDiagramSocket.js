@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { websocketBaseUrlFrom } from '../utils/runtimeUrls';
 
 // Reconnects after transient server/network failures and keeps the latest canvas
 // update until the channel becomes available again.
@@ -16,7 +17,7 @@ export function useDiagramSocket(diagramId, onMessage) {
 
     let disposed = false;
     const apiUrl = import.meta.env.VITE_API_URL || window.location.origin;
-    const base = import.meta.env.VITE_WS_URL || apiUrl.replace(/^http/, 'ws').replace(/\/api\/?$/, '/ws');
+    const base = websocketBaseUrlFrom(apiUrl, import.meta.env.VITE_WS_URL);
     const url = `${base.replace(/\/$/, '')}/diagramas/${diagramId}/`;
     const connect = () => {
       if (disposed) return;
